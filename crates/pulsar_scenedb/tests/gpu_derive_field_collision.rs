@@ -85,7 +85,8 @@ fn same_shaped_gpu_fields_on_different_derived_types_do_not_collide() {
     DeriveTestMaterial::register_gpu_columns(&mut store, ROW_CAPACITY, ctx.device());
     DeriveTestLight::register_gpu_columns(&mut store, ROW_CAPACITY, ctx.device());
 
-    let material_type = <DeriveTestMaterial as pulsar_scenedb::cell_type::SceneColumnSet>::cell_type();
+    let material_type =
+        <DeriveTestMaterial as pulsar_scenedb::cell_type::SceneColumnSet>::cell_type();
     let light_type = <DeriveTestLight as pulsar_scenedb::cell_type::SceneColumnSet>::cell_type();
 
     let mut material_cell =
@@ -98,6 +99,17 @@ fn same_shaped_gpu_fields_on_different_derived_types_do_not_collide() {
     let light_cell_id = store
         .register_cell(&light_cell, 0)
         .expect("register lights cell");
+
+    assert_eq!(
+        store.gpu_column_descs_for(material_cell_id),
+        DeriveTestMaterial::gpu_columns(),
+        "cell reflection must retain the derive descriptor for its actual fixed GPU column",
+    );
+    assert_eq!(
+        store.gpu_column_descs_for(light_cell_id),
+        DeriveTestLight::gpu_columns(),
+        "reflection must filter out other globally registered GPU columns",
+    );
 
     let mut driver = FrameDriver::new();
     let sim_a = driver.begin();
@@ -143,7 +155,10 @@ fn same_shaped_gpu_fields_on_different_derived_types_do_not_collide() {
 
     let material_row = store.row_region_base(material_cell_id) as u64;
     let light_row = store.row_region_base(light_cell_id) as u64;
-    assert_ne!(material_row, light_row, "disjoint cell regions, sanity check");
+    assert_ne!(
+        material_row, light_row,
+        "disjoint cell regions, sanity check"
+    );
 
     // The wrapper types themselves are unnameable from outside this crate's
     // own generated code (defined inside an anonymous `const _: () = {};`

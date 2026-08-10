@@ -66,17 +66,43 @@ impl RangeList {
             self.free.remove(idx);
         }
     }
+
+    /// End of the highest allocated byte. A free tail does not contribute to
+    /// the logical address span, while holes below it deliberately do.
+    fn allocated_high_water(&self, total: u64) -> u64 {
+        self.free
+            .last()
+            .filter(|&&(offset, len)| offset + len == total)
+            .map_or(total, |&(offset, _)| offset)
+    }
 }
+
+/// Default stable identities for standalone geometry arenas.
+pub const GEOMETRY_VERTEX_BUFFER_KEY: &str = "scenedb.geometry.vertices";
+pub const GEOMETRY_INDEX_BUFFER_KEY: &str = "scenedb.geometry.indices";
 
 /// Global vertex + index buffers for all resident geometry (design Rev 2 §3):
 /// write-once-at-load uploads, byte-range suballocated. No CPU copy is
 /// retained here — residency only; the asset system owns source blobs for
 /// any future re-upload (e.g. Test 14's asset half, a later task).
 pub struct GeometryArena {
-    vertex: wgpu::Buffer,
+    // Boxing is load-bearing for growable arenas: callers that fingerprint a
+    // borrowed `&wgpu::Buffer` by address must observe an address change when
+    // the physical allocation changes.
+    vertex: Box<wgpu::Buffer>,
     vfree: RangeList,
-    index: wgpu::Buffer,
+    vertex_bytes: u64,
+    vertex_epoch: u64,
+    vertex_key: &'static str,
+    index: Box<wgpu::Buffer>,
     ifree: RangeList,
+    index_bytes: u64,
+    index_epoch: u64,
+    index_key: &'static str,
+    /// Present only for the opt-in growable asset-arena mode. `new` remains
+    /// the fixed-budget API and retains its hard `ArenaError::Exhausted`
+    /// behavior.
+    grow_device: Option<std::sync::Arc<wgpu::Device>>,
     /// Test 13 instrumentation (§ see `upload_count` below): one shared
     /// counter across BOTH buffers — the teardown gate only needs to know
     /// "did anything get uploaded", not which of the two buffers.
@@ -85,8 +111,52 @@ pub struct GeometryArena {
 
 impl GeometryArena {
     pub fn new(ctx: &EngineGpuContext, vertex_bytes: u64, index_bytes: u64) -> Self {
+        Self::new_inner(
+            ctx,
+            vertex_bytes,
+            index_bytes,
+            GEOMETRY_VERTEX_BUFFER_KEY,
+            GEOMETRY_INDEX_BUFFER_KEY,
+            false,
+        )
+    }
+
+    /// Construct a geometry arena which preserves all resident bytes through
+    /// geometric GPU-to-GPU growth. This is the explicit write-once handoff
+    /// path for asset systems whose public API is not backed by a fixed VRAM
+    /// budget. Existing offsets remain stable; only the physical buffer
+    /// allocation and corresponding epoch change.
+    pub fn new_growable_named(
+        ctx: &EngineGpuContext,
+        vertex_bytes: u64,
+        index_bytes: u64,
+        vertex_key: &'static str,
+        index_key: &'static str,
+    ) -> Self {
+        Self::new_inner(
+            ctx,
+            vertex_bytes,
+            index_bytes,
+            vertex_key,
+            index_key,
+            true,
+        )
+    }
+
+    fn new_inner(
+        ctx: &EngineGpuContext,
+        vertex_bytes: u64,
+        index_bytes: u64,
+        vertex_key: &'static str,
+        index_key: &'static str,
+        growable: bool,
+    ) -> Self {
+        assert!(vertex_bytes > 0, "geometry vertex arena must not be empty");
+        assert!(index_bytes > 0, "geometry index arena must not be empty");
+        assert_eq!(vertex_bytes % 4, 0, "geometry vertex arena must be 4-byte aligned");
+        assert_eq!(index_bytes % 4, 0, "geometry index arena must be 4-byte aligned");
         let vertex = ctx.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("geometry-arena-vertex"),
+            label: Some(vertex_key),
             size: vertex_bytes,
             // `VERTEX` (alongside `STORAGE`): the classic vertex-fetch draw
             // path is still the M3-α default (design Rev 2 §2) — VG/meshlet
@@ -99,7 +169,7 @@ impl GeometryArena {
             mapped_at_creation: false,
         });
         let index = ctx.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("geometry-arena-index"),
+            label: Some(index_key),
             size: index_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -108,20 +178,101 @@ impl GeometryArena {
             mapped_at_creation: false,
         });
         Self {
-            vertex,
+            vertex: Box::new(vertex),
             vfree: RangeList::new(vertex_bytes),
-            index,
+            vertex_bytes,
+            vertex_epoch: 0,
+            vertex_key,
+            index: Box::new(index),
             ifree: RangeList::new(index_bytes),
+            index_bytes,
+            index_epoch: 0,
+            index_key,
+            grow_device: growable.then(|| std::sync::Arc::clone(ctx.device())),
             upload_count: 0,
         }
+    }
+
+    fn grown_size(current: u64, required_tail: u64, max: u64) -> Option<u64> {
+        let required = current.checked_add(required_tail)?;
+        if required > max {
+            return None;
+        }
+        let mut next = current.max(4);
+        while next < required {
+            next = next.checked_mul(2).unwrap_or(max).min(max);
+            if next < required && next == max {
+                return None;
+            }
+        }
+        Some(next)
+    }
+
+    fn grow_vertex(&mut self, queue: &wgpu::Queue, required_tail: u64) -> Result<(), ArenaError> {
+        let device = self.grow_device.as_ref().ok_or(ArenaError::Exhausted)?;
+        let max = device.limits().max_buffer_size.min(u32::MAX as u64) & !3;
+        let new_bytes = Self::grown_size(self.vertex_bytes, required_tail, max)
+            .ok_or(ArenaError::Exhausted)?;
+        let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(self.vertex_key),
+            size: new_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("geometry-arena-grow-vertex"),
+        });
+        encoder.copy_buffer_to_buffer(self.vertex.as_ref(), 0, &new_buffer, 0, self.vertex_bytes);
+        queue.submit([encoder.finish()]);
+        self.vfree.free(self.vertex_bytes, new_bytes - self.vertex_bytes);
+        self.vertex = Box::new(new_buffer);
+        self.vertex_bytes = new_bytes;
+        self.vertex_epoch = self.vertex_epoch.wrapping_add(1);
+        Ok(())
+    }
+
+    fn grow_index(&mut self, queue: &wgpu::Queue, required_tail: u64) -> Result<(), ArenaError> {
+        let device = self.grow_device.as_ref().ok_or(ArenaError::Exhausted)?;
+        let max = device.limits().max_buffer_size.min(u32::MAX as u64) & !3;
+        let new_bytes = Self::grown_size(self.index_bytes, required_tail, max)
+            .ok_or(ArenaError::Exhausted)?;
+        let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(self.index_key),
+            size: new_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("geometry-arena-grow-index"),
+        });
+        encoder.copy_buffer_to_buffer(self.index.as_ref(), 0, &new_buffer, 0, self.index_bytes);
+        queue.submit([encoder.finish()]);
+        self.ifree.free(self.index_bytes, new_bytes - self.index_bytes);
+        self.index = Box::new(new_buffer);
+        self.index_bytes = new_bytes;
+        self.index_epoch = self.index_epoch.wrapping_add(1);
+        Ok(())
     }
 
     /// 4-byte-aligned first-fit alloc + `write_buffer`. Returns the byte
     /// offset (the design §6.1 `vertex_offset` value). No CPU copy retained.
     pub fn upload_vertices(&mut self, queue: &wgpu::Queue, bytes: &[u8]) -> Result<u32, ArenaError> {
-        let offset = self.vfree.alloc(bytes.len() as u64, 4).ok_or(ArenaError::Exhausted)?;
+        let len = bytes.len() as u64;
+        let offset = match self.vfree.alloc(len, 4) {
+            Some(offset) => offset,
+            None => {
+                self.grow_vertex(queue, len)?;
+                self.vfree.alloc(len, 4).ok_or(ArenaError::Exhausted)?
+            }
+        };
         debug_assert!(offset <= u32::MAX as u64, "arena offset exceeds the u32 C5 contract");
-        queue.write_buffer(&self.vertex, offset, bytes);
+        queue.write_buffer(self.vertex.as_ref(), offset, bytes);
         self.upload_count += 1;
         Ok(offset as u32)
     }
@@ -129,9 +280,16 @@ impl GeometryArena {
     /// 4-byte-aligned first-fit alloc + `write_buffer`. Returns the byte
     /// offset (the design §6.1 `index_offset` value). No CPU copy retained.
     pub fn upload_indices(&mut self, queue: &wgpu::Queue, bytes: &[u8]) -> Result<u32, ArenaError> {
-        let offset = self.ifree.alloc(bytes.len() as u64, 4).ok_or(ArenaError::Exhausted)?;
+        let len = bytes.len() as u64;
+        let offset = match self.ifree.alloc(len, 4) {
+            Some(offset) => offset,
+            None => {
+                self.grow_index(queue, len)?;
+                self.ifree.alloc(len, 4).ok_or(ArenaError::Exhausted)?
+            }
+        };
         debug_assert!(offset <= u32::MAX as u64, "arena offset exceeds the u32 C5 contract");
-        queue.write_buffer(&self.index, offset, bytes);
+        queue.write_buffer(self.index.as_ref(), offset, bytes);
         self.upload_count += 1;
         Ok(offset as u32)
     }
@@ -139,21 +297,49 @@ impl GeometryArena {
     /// Asset-unload path: return a previous `upload_vertices` range to the
     /// free list (coalesced with adjacent free spans).
     pub fn free_vertices(&mut self, offset: u32, len: u32) {
-        self.vfree.free(offset as u64, len as u64);
+        if len != 0 {
+            self.vfree.free(offset as u64, len as u64);
+        }
     }
 
     /// Asset-unload path: return a previous `upload_indices` range to the
     /// free list (coalesced with adjacent free spans).
     pub fn free_indices(&mut self, offset: u32, len: u32) {
-        self.ifree.free(offset as u64, len as u64);
+        if len != 0 {
+            self.ifree.free(offset as u64, len as u64);
+        }
     }
 
     pub fn vertex_buffer(&self) -> &wgpu::Buffer {
-        &self.vertex
+        self.vertex.as_ref()
     }
 
     pub fn index_buffer(&self) -> &wgpu::Buffer {
-        &self.index
+        self.index.as_ref()
+    }
+
+    pub fn vertex_buffer_key(&self) -> &'static str {
+        self.vertex_key
+    }
+
+    pub fn index_buffer_key(&self) -> &'static str {
+        self.index_key
+    }
+
+    pub fn vertex_epoch(&self) -> u64 {
+        self.vertex_epoch
+    }
+
+    pub fn index_epoch(&self) -> u64 {
+        self.index_epoch
+    }
+
+    pub fn vertex_high_water_bytes(&self) -> u64 {
+        self.vfree.allocated_high_water(self.vertex_bytes)
+    }
+
+    pub fn index_high_water_bytes(&self) -> u64 {
+        self.ifree.allocated_high_water(self.index_bytes)
     }
 
     /// Test 13 instrumentation: the teardown gate asserts these do not move
@@ -849,6 +1035,63 @@ pub enum TextureError {
     SlotVacant,
     /// `slot` was never allocated (`>= slot_count()`).
     SlotOutOfRange,
+    /// An explicit-slot restore targeted a slot that is already live. Use
+    /// [`TextureStore::replace`] when intentionally rebuilding that resident
+    /// asset in place.
+    SlotOccupied,
+    /// An in-place rebuild tried to change the texture's physical contract.
+    /// Stable slots may replace bytes/device objects, but not their extent,
+    /// mip/sample counts, dimension, format, usages, or view formats.
+    IncompatibleDescriptor,
+    /// Texture uploads currently accept one complete mip. Helio's public
+    /// `TextureUpload` has exactly that shape; multi-mip source layout needs
+    /// explicit per-mip offsets before it can be supported safely.
+    UnsupportedMipLevelCount(u32),
+    /// Queue texture writes cannot populate multisampled textures.
+    UnsupportedSampleCount(u32),
+    /// A zero component in the texture extent is invalid.
+    InvalidExtent,
+    /// Uploads require `COPY_DST` residency usage.
+    MissingCopyDstUsage,
+    /// Depth/stencil or multi-planar formats have no unambiguous all-aspect
+    /// block copy size for this material-texture upload path.
+    UnsupportedFormat,
+    /// The source must contain exactly one tightly packed base mip, including
+    /// block rounding for BC/ETC2/ASTC formats and every depth/array layer.
+    InvalidDataLength { expected: usize, actual: usize },
+    /// Descriptor dimensions overflow the host address space while computing
+    /// the required tightly packed upload length.
+    DataSizeOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextureShape {
+    size: wgpu::Extent3d,
+    mip_level_count: u32,
+    sample_count: u32,
+    dimension: wgpu::TextureDimension,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+    view_formats: Vec<wgpu::TextureFormat>,
+}
+
+impl TextureShape {
+    fn from_descriptor(desc: &wgpu::TextureDescriptor<'_>) -> Self {
+        Self {
+            size: desc.size,
+            mip_level_count: desc.mip_level_count,
+            sample_count: desc.sample_count,
+            dimension: desc.dimension,
+            format: desc.format,
+            usage: desc.usage,
+            view_formats: desc.view_formats.to_vec(),
+        }
+    }
+}
+
+struct ResidentTexture {
+    texture: wgpu::Texture,
+    shape: TextureShape,
 }
 
 /// SceneDB-owned bindless texture residency (Ownership Law, CONTRACTS C0,
@@ -858,7 +1101,7 @@ pub enum TextureError {
 /// Slot ids recycle LIFO on `unregister`, same shape as the crate's other
 /// slot-recycling stores.
 pub struct TextureStore {
-    textures: Vec<Option<wgpu::Texture>>,
+    textures: Vec<Option<ResidentTexture>>,
     free: Vec<u32>,
     next: u32,
     max_slots: u32,
@@ -884,15 +1127,9 @@ impl TextureStore {
 
     /// Allocates a slot (LIFO free-list reuse, else the next fresh index;
     /// `SlotsExhausted` once `max_slots` is reached with nothing to recycle),
-    /// creates the `wgpu::Texture` from `desc`, and uploads `data` at mip 0
-    /// via `queue.write_texture` with a tightly-packed layout derived from
-    /// `desc` (`bytes_per_row = format.block_copy_size(None) * size.width`;
-    /// single-mip M3-α scope — mip chains ride to the asset pipeline; only
-    /// uncompressed (1×1 block) formats are supported here — see the
-    /// `block_dimensions() == (1, 1)` guard below. Block-compressed formats
-    /// (BC/ETC2/ASTC) need `ceil(width / block_width)` row arithmetic, not
-    /// the plain `width` multiply used here, so they are out of scope until
-    /// a later task adds it.
+    /// creates the `wgpu::Texture` from `desc`, and uploads one complete base
+    /// mip. Ordinary and block-compressed formats both use their physical
+    /// block extent, including non-block-aligned BC/ETC2/ASTC dimensions.
     ///
     /// Owns the resulting `wgpu::Texture` (C0/§10 G4 — Test 13: textures
     /// survive renderer teardown). Caller retains source data for
@@ -904,68 +1141,189 @@ impl TextureStore {
         desc: &wgpu::TextureDescriptor<'_>,
         data: &[u8],
     ) -> Result<u32, TextureError> {
-        let slot = match self.free.pop() {
-            Some(s) => s,
-            None => {
-                if self.next >= self.max_slots {
-                    return Err(TextureError::SlotsExhausted);
-                }
-                let s = self.next;
-                self.next += 1;
-                s
-            }
+        let slot = match self.free.last().copied() {
+            Some(slot) => slot,
+            None if self.next < self.max_slots => self.next,
+            None => return Err(TextureError::SlotsExhausted),
         };
 
-        let texture = device.create_texture(desc);
+        let resident = Self::create_resident(device, queue, desc, data)?;
 
-        // `block_copy_size(None)` returns `Some(_)` for essentially every
-        // format (BC/ETC2/ASTC included — only depth/multi-planar formats
-        // return `None`), so it cannot itself distinguish "uncompressed" —
-        // guard on the block dimensions instead: uncompressed formats are
-        // exactly the ones with a 1x1 texel block (see `block_dimensions`'s
-        // own doc). A compressed format here would otherwise silently get
-        // the wrong `bytes_per_row` (this arithmetic assumes one block per
-        // texel) and panic deep inside `write_texture` instead of at this
-        // well-documented boundary.
-        assert_eq!(
-            desc.format.block_dimensions(),
-            (1, 1),
-            "TextureStore::register (M3-α scope): only uncompressed (1x1 block) formats are \
-             supported — block-compressed formats (BC/ETC2/ASTC) need block-aware row \
-             arithmetic, not yet implemented"
-        );
+        if self.free.last() == Some(&slot) {
+            self.free.pop();
+        } else {
+            debug_assert_eq!(slot, self.next);
+            self.next += 1;
+            self.textures.resize_with(self.next as usize, || None);
+        }
+        debug_assert!(self.textures[slot as usize].is_none());
+        self.textures[slot as usize] = Some(resident);
+        self.upload_count += 1;
+
+        Ok(slot)
+    }
+
+    /// Restore a texture at an exact physical slot. This is the device-loss
+    /// and asset-key reload seam: gaps below a newly restored high slot become
+    /// ordinary recyclable vacancies, while the restored slot itself remains
+    /// stable. An occupied target is rejected rather than silently replacing
+    /// a different live asset.
+    pub fn register_at(
+        &mut self,
+        slot: u32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        desc: &wgpu::TextureDescriptor<'_>,
+        data: &[u8],
+    ) -> Result<u32, TextureError> {
+        if slot >= self.max_slots {
+            return Err(TextureError::SlotOutOfRange);
+        }
+        if self
+            .textures
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+            .is_some()
+        {
+            return Err(TextureError::SlotOccupied);
+        }
+        let resident = Self::create_resident(device, queue, desc, data)?;
+
+        if slot >= self.next {
+            let old_next = self.next;
+            self.next = slot + 1;
+            self.textures.resize_with(self.next as usize, || None);
+            self.free.extend(old_next..slot);
+        } else {
+            let free_index = self
+                .free
+                .iter()
+                .position(|candidate| *candidate == slot)
+                .expect("vacant allocated TextureStore slot missing from free list");
+            self.free.remove(free_index);
+        }
+        self.textures[slot as usize] = Some(resident);
+        self.upload_count += 1;
+        Ok(slot)
+    }
+
+    /// Alias spelling for callers explicitly restoring a retained asset-key
+    /// mapping into a fresh store.
+    pub fn restore_at(
+        &mut self,
+        slot: u32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        desc: &wgpu::TextureDescriptor<'_>,
+        data: &[u8],
+    ) -> Result<u32, TextureError> {
+        self.register_at(slot, device, queue, desc, data)
+    }
+
+    /// Replace the GPU object and base-mip bytes at an occupied slot without
+    /// changing allocation extent, liveness, or free-list order. The complete
+    /// physical descriptor (except its debug label) must match so existing
+    /// view/binding assumptions cannot be invalidated accidentally.
+    pub fn replace(
+        &mut self,
+        slot: u32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        desc: &wgpu::TextureDescriptor<'_>,
+        data: &[u8],
+    ) -> Result<(), TextureError> {
+        if slot >= self.next {
+            return Err(TextureError::SlotOutOfRange);
+        }
+        let current = self
+            .textures
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+            .ok_or(TextureError::SlotVacant)?;
+        if current.shape != TextureShape::from_descriptor(desc) {
+            return Err(TextureError::IncompatibleDescriptor);
+        }
+        let resident = Self::create_resident(device, queue, desc, data)?;
+        self.textures[slot as usize] = Some(resident);
+        self.upload_count += 1;
+        Ok(())
+    }
+
+    /// Device-loss-oriented spelling of [`Self::replace`]. The old device
+    /// object is exchanged only after descriptor/data validation and creation
+    /// of the replacement, so a rejected rebuild leaves slot liveness intact.
+    pub fn rebuild_at(
+        &mut self,
+        slot: u32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        desc: &wgpu::TextureDescriptor<'_>,
+        data: &[u8],
+    ) -> Result<(), TextureError> {
+        self.replace(slot, device, queue, desc, data)
+    }
+
+    fn create_resident(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        desc: &wgpu::TextureDescriptor<'_>,
+        data: &[u8],
+    ) -> Result<ResidentTexture, TextureError> {
+        if desc.size.width == 0
+            || desc.size.height == 0
+            || desc.size.depth_or_array_layers == 0
+        {
+            return Err(TextureError::InvalidExtent);
+        }
+        if desc.mip_level_count != 1 {
+            return Err(TextureError::UnsupportedMipLevelCount(
+                desc.mip_level_count,
+            ));
+        }
+        if desc.sample_count != 1 {
+            return Err(TextureError::UnsupportedSampleCount(desc.sample_count));
+        }
+        if !desc.usage.contains(wgpu::TextureUsages::COPY_DST) {
+            return Err(TextureError::MissingCopyDstUsage);
+        }
+
         let block_size = desc
             .format
             .block_copy_size(None)
-            // Reachable only by 1x1-block formats WITHOUT a defined copy
-            // size: aspect-ambiguous depth-stencil (Depth24Plus[Stencil8],
-            // Depth32FloatStencil8) and multi-planar (NV12/P010) formats —
-            // out of M3-α scope, and loud here rather than a garbage
-            // bytes_per_row downstream.
-            .expect(
-                "depth-stencil and multi-planar formats are out of TextureStore's M3-\u{3b1} scope \
-                 (no single block_copy_size)",
-            );
-        let bytes_per_row = block_size * desc.size.width;
+            .ok_or(TextureError::UnsupportedFormat)?;
+        let (block_width, block_height) = desc.format.block_dimensions();
+        let physical_size = desc.size.physical_size(desc.format);
+        let width_blocks = physical_size.width / block_width;
+        let height_blocks = physical_size.height / block_height;
+        let expected_u64 = u64::from(block_size)
+            .checked_mul(u64::from(width_blocks))
+            .and_then(|size| size.checked_mul(u64::from(height_blocks)))
+            .and_then(|size| size.checked_mul(u64::from(physical_size.depth_or_array_layers)))
+            .ok_or(TextureError::DataSizeOverflow)?;
+        let expected =
+            usize::try_from(expected_u64).map_err(|_| TextureError::DataSizeOverflow)?;
+        if data.len() != expected {
+            return Err(TextureError::InvalidDataLength {
+                expected,
+                actual: data.len(),
+            });
+        }
+
+        let texture = device.create_texture(desc);
         queue.write_texture(
             texture.as_image_copy(),
             data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(desc.size.height),
+                bytes_per_row: Some(block_size * width_blocks),
+                rows_per_image: Some(height_blocks),
             },
-            desc.size,
+            physical_size,
         );
-        self.upload_count += 1;
-
-        let slot_idx = slot as usize;
-        if slot_idx >= self.textures.len() {
-            self.textures.resize_with(slot_idx + 1, || None);
-        }
-        self.textures[slot_idx] = Some(texture);
-
-        Ok(slot)
+        Ok(ResidentTexture {
+            texture,
+            shape: TextureShape::from_descriptor(desc),
+        })
     }
 
     /// Drops `slot`'s texture and returns the slot id to the LIFO free list
@@ -990,7 +1348,10 @@ impl TextureStore {
     /// itself (C0/§10 G4: SceneDB owns the texture, not the render-side use
     /// of it).
     pub fn texture(&self, slot: u32) -> Option<&wgpu::Texture> {
-        self.textures.get(slot as usize).and_then(Option::as_ref)
+        self.textures
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+            .map(|resident| &resident.texture)
     }
 
     /// The bindless slot table's current extent (one past the highest slot

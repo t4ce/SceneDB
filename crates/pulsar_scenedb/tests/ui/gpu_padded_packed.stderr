@@ -1,0 +1,11 @@
+error[E0080]: evaluation panicked: derive(Pod) was applied to a type with padding
+ --> tests/ui/gpu_padded_packed.rs:6:10
+  |
+6 | #[derive(SceneStore, Clone, Copy)]
+  |          ^^^^^^^^^^ evaluation of `_::_` failed here
+
+error[E0080]: evaluation panicked: #[gpu(layout = packed)] generated an implicitly padded shader row for ImplicitlyPaddedGpuRow; add explicit #[gpu] padding fields so every byte is initialized
+ --> tests/ui/gpu_padded_packed.rs:6:10
+  |
+6 | #[derive(SceneStore, Clone, Copy)]
+  |          ^^^^^^^^^^ evaluation of `_::_` failed here

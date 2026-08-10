@@ -130,6 +130,47 @@ fn packed_fields_land_in_one_buffer_in_gpu_field_declaration_order() {
     // in these 24 bytes -- already implied by the exact byte-for-byte
     // asserts above (there's no slot it could occupy without one of them
     // failing), but worth stating as the explicit claim being tested.
+
+    // Packed differential dispatch compares the one assembled shader row,
+    // not the source component's full bytes: changing only a CPU field must
+    // not dirty the packed destination.
+    world.insert(
+        entity,
+        PackedInstance {
+            model,
+            not_gpu_at_all: 123,
+            mesh_id: 42,
+            flags: 7,
+        },
+    );
+    let cpu_only = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((cpu_only.ranges, cpu_only.bytes), (0, 0));
+
+    // An unchanged replacement is likewise a true no-op.
+    world.insert(
+        entity,
+        PackedInstance {
+            model,
+            not_gpu_at_all: 123,
+            mesh_id: 42,
+            flags: 7,
+        },
+    );
+    let unchanged = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((unchanged.ranges, unchanged.bytes), (0, 0));
+
+    // One packed field changes the whole physical row by definition.
+    world.insert(
+        entity,
+        PackedInstance {
+            model,
+            not_gpu_at_all: 123,
+            mesh_id: 42,
+            flags: 8,
+        },
+    );
+    let changed = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((changed.ranges, changed.bytes), (1, PACKED_ROW_BYTES));
 }
 
 #[test]

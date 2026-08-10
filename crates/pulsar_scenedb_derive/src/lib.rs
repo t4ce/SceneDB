@@ -14,9 +14,31 @@ mod subsystem;
 ///
 /// - `#[gpu]` — mark a field as GPU-mirrored (requires the `gpu` feature on
 ///   `pulsar_scenedb`).
-/// - `#[gpu(mirror = Once)]` — GPU-mirrored field uploaded once at registration.
+/// - `#[gpu(mirror = Once)]` — one deferred GPU handoff per World component-
+///   presence lifetime; removal tombstones it and re-insertion hands off again.
 /// - `#[gpu(mirror = DirtyTracked)]` — GPU-mirrored field synced every frame
 ///   (default for bare `#[gpu]`).
+/// - `#[gpu(buffer = "general_mesh_buf")]` — assign a stable, explicit GPU
+///   buffer identity. Fixed CellStorage fields may reuse the same key when
+///   their row types/layouts and mirror modes match because cells occupy
+///   disjoint row regions. Growable World registration permits only one
+///   owning component per canonical buffer: two component types would write
+///   the same entity row and are rejected instead of becoming
+///   last-write-wins.
+/// - Options compose, for example
+///   `#[gpu(mirror = Once, buffer = "general_mesh_buf")]`.
+///
+/// GPU fields additionally implement bytemuck's `Pod + Zeroable` contract.
+/// This rejects implicit padding because World differential dispatch compares
+/// exact shader-row bytes. Packed rows must have no implicit internal or
+/// trailing padding; model required shader padding as explicit `#[gpu]`
+/// fields.
+///
+/// Generic structs remain supported when all fields are CPU-only (subject to
+/// the usual `Pod + 'static` bounds for stored field types). A generic struct
+/// with any `#[gpu]` field is rejected until SceneDB has an explicit
+/// per-monomorph GPU inventory/partner registration API; use a concrete
+/// wrapper type for GPU-mirrored data today.
 #[proc_macro_derive(SceneStore, attributes(gpu))]
 pub fn derive_scene_store(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

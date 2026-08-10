@@ -30,7 +30,12 @@ pub trait GrowableGpuBufferDispatch: Send + Sync {
     /// mismatches are a logic error in the caller (the derive-generated
     /// dispatch always passes exactly one element's worth), asserted rather
     /// than silently truncated or padded.
-    fn write_row_growing(&self, queue: &wgpu::Queue, row: u32, data: &[u8]) -> Result<(), CapacityError>;
+    fn write_row_growing(
+        &self,
+        queue: &wgpu::Queue,
+        row: u32,
+        data: &[u8],
+    ) -> Result<(), CapacityError>;
 
     fn epoch(&self) -> u64;
     fn capacity(&self) -> u32;
@@ -55,6 +60,11 @@ pub trait GrowableGpuBufferDispatch: Send + Sync {
     /// exists to make safe, and a stashed reference would defeat that.
     fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer));
 
+    /// Clone the current physical handle together with the allocation epoch
+    /// under one read lock. This is the non-borrowing form for bind-group
+    /// caches; fetching the handle and epoch separately can race growth.
+    fn buffer_snapshot(&self) -> (wgpu::Buffer, u64);
+
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -76,12 +86,20 @@ pub struct GrowableSceneBuffer<T: Pod> {
 }
 
 impl<T: Pod + Send + Sync + 'static> GrowableSceneBuffer<T> {
-    pub fn new(device: Arc<wgpu::Device>, label: &str, initial_capacity: u32, max_capacity: Option<u32>) -> Self {
+    pub fn new(
+        device: Arc<wgpu::Device>,
+        label: &str,
+        initial_capacity: u32,
+        max_capacity: Option<u32>,
+    ) -> Self {
         let mut buf = DynamicGpuBuffer::new(&device, label, initial_capacity);
         if let Some(max) = max_capacity {
             buf = buf.with_max_capacity(max);
         }
-        Self { device, inner: RwLock::new(buf) }
+        Self {
+            device,
+            inner: RwLock::new(buf),
+        }
     }
 
     /// Grows if `row` doesn't fit the current capacity, then writes one
@@ -92,16 +110,27 @@ impl<T: Pod + Send + Sync + 'static> GrowableSceneBuffer<T> {
     /// capacity under the write lock in case another writer grew it first
     /// (the classic double-checked-locking shape — avoids two concurrent
     /// writers both reallocating for the same shortfall).
-    pub fn write_row_growing(&self, queue: &wgpu::Queue, row: u32, data: &[T]) -> Result<(), CapacityError> {
+    pub fn write_row_growing(
+        &self,
+        queue: &wgpu::Queue,
+        row: u32,
+        data: &[T],
+    ) -> Result<(), CapacityError> {
         let min_capacity = row.saturating_add(data.len() as u32);
         {
-            let guard = self.inner.read().expect("GrowableSceneBuffer lock poisoned");
+            let guard = self
+                .inner
+                .read()
+                .expect("GrowableSceneBuffer lock poisoned");
             if min_capacity <= guard.capacity() {
                 guard.write(queue, row, data);
                 return Ok(());
             }
         }
-        let mut guard = self.inner.write().expect("GrowableSceneBuffer lock poisoned");
+        let mut guard = self
+            .inner
+            .write()
+            .expect("GrowableSceneBuffer lock poisoned");
         if min_capacity > guard.capacity() {
             guard.ensure_capacity(&self.device, queue, min_capacity)?;
         }
@@ -110,40 +139,68 @@ impl<T: Pod + Send + Sync + 'static> GrowableSceneBuffer<T> {
     }
 
     pub fn epoch(&self) -> u64 {
-        self.inner.read().expect("GrowableSceneBuffer lock poisoned").epoch()
+        self.inner
+            .read()
+            .expect("GrowableSceneBuffer lock poisoned")
+            .epoch()
     }
 
     pub fn capacity(&self) -> u32 {
-        self.inner.read().expect("GrowableSceneBuffer lock poisoned").capacity()
+        self.inner
+            .read()
+            .expect("GrowableSceneBuffer lock poisoned")
+            .capacity()
     }
 
     pub fn with_buffer(&self, f: &mut dyn FnMut(&wgpu::Buffer)) {
-        let guard = self.inner.read().expect("GrowableSceneBuffer lock poisoned");
+        let guard = self
+            .inner
+            .read()
+            .expect("GrowableSceneBuffer lock poisoned");
         f(guard.buffer());
     }
 
     /// See [`GrowableGpuBufferDispatch::reserve`].
     pub fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
-        let mut guard = self.inner.write().expect("GrowableSceneBuffer lock poisoned");
+        let mut guard = self
+            .inner
+            .write()
+            .expect("GrowableSceneBuffer lock poisoned");
         guard.reserve(&self.device, queue, capacity)
     }
 
     /// See [`GrowableGpuBufferDispatch::shrink_to_fit`].
-    pub fn shrink_to_fit(&self, queue: &wgpu::Queue, highest_live_row: u32, slack_factor: f32) -> bool {
-        let mut guard = self.inner.write().expect("GrowableSceneBuffer lock poisoned");
+    pub fn shrink_to_fit(
+        &self,
+        queue: &wgpu::Queue,
+        highest_live_row: u32,
+        slack_factor: f32,
+    ) -> bool {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("GrowableSceneBuffer lock poisoned");
         guard.shrink_to_fit(&self.device, queue, highest_live_row, slack_factor)
     }
 }
 
 impl<T: Pod + Send + Sync + 'static> GrowableGpuBufferDispatch for GrowableSceneBuffer<T> {
-    fn write_row_growing(&self, queue: &wgpu::Queue, row: u32, data: &[u8]) -> Result<(), CapacityError> {
+    fn write_row_growing(
+        &self,
+        queue: &wgpu::Queue,
+        row: u32,
+        data: &[u8],
+    ) -> Result<(), CapacityError> {
         assert_eq!(
             data.len() % std::mem::size_of::<T>(),
             0,
             "byte slice length not a multiple of element size"
         );
         let typed: &[T] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const T, data.len() / std::mem::size_of::<T>())
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const T,
+                data.len() / std::mem::size_of::<T>(),
+            )
         };
         GrowableSceneBuffer::write_row_growing(self, queue, row, typed)
     }
@@ -172,6 +229,14 @@ impl<T: Pod + Send + Sync + 'static> GrowableGpuBufferDispatch for GrowableScene
         GrowableSceneBuffer::with_buffer(self, f)
     }
 
+    fn buffer_snapshot(&self) -> (wgpu::Buffer, u64) {
+        let guard = self
+            .inner
+            .read()
+            .expect("GrowableSceneBuffer lock poisoned");
+        (guard.buffer().clone(), guard.epoch())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -198,7 +263,12 @@ mod tests {
         (Arc::new(device), Arc::new(queue))
     }
 
-    fn readback(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+    fn readback(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buf: &wgpu::Buffer,
+        bytes: u64,
+    ) -> Vec<u8> {
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: bytes,
@@ -210,7 +280,9 @@ mod tests {
         queue.submit([enc.finish()]);
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
         let data = slice.get_mapped_range().expect("mapped range").to_vec();
         staging.unmap();
         data
@@ -219,15 +291,19 @@ mod tests {
     #[test]
     fn write_past_capacity_grows_transparently_and_preserves_prior_rows() {
         let (device, queue) = test_device();
-        let buf: GrowableSceneBuffer<u32> = GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, None);
+        let buf: GrowableSceneBuffer<u32> =
+            GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, None);
         assert_eq!(buf.capacity(), 2);
         assert_eq!(buf.epoch(), 0);
 
-        buf.write_row_growing(&queue, 0, &[111]).expect("row 0 fits initial capacity");
-        buf.write_row_growing(&queue, 1, &[222]).expect("row 1 fits initial capacity");
+        buf.write_row_growing(&queue, 0, &[111])
+            .expect("row 0 fits initial capacity");
+        buf.write_row_growing(&queue, 1, &[222])
+            .expect("row 1 fits initial capacity");
 
         // Row 100 is way past capacity 2 -- must grow transparently, not panic.
-        buf.write_row_growing(&queue, 100, &[999]).expect("must grow, not fail (no max_capacity set)");
+        buf.write_row_growing(&queue, 100, &[999])
+            .expect("must grow, not fail (no max_capacity set)");
         assert!(buf.capacity() > 100);
         assert!(buf.epoch() >= 1);
 
@@ -246,9 +322,11 @@ mod tests {
     #[test]
     fn max_capacity_ceiling_is_still_honored_through_the_growing_write_path() {
         let (device, queue) = test_device();
-        let buf: GrowableSceneBuffer<u32> = GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, Some(4));
+        let buf: GrowableSceneBuffer<u32> =
+            GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, Some(4));
 
-        buf.write_row_growing(&queue, 3, &[1]).expect("row 3 fits within max_capacity 4");
+        buf.write_row_growing(&queue, 3, &[1])
+            .expect("row 3 fits within max_capacity 4");
         let err = buf
             .write_row_growing(&queue, 10, &[1])
             .expect_err("row 10 exceeds max_capacity 4 -- must error, not silently drop the write");
@@ -258,7 +336,8 @@ mod tests {
     #[test]
     fn reserve_moves_growth_off_the_write_path() {
         let (device, queue) = test_device();
-        let buf: GrowableSceneBuffer<u32> = GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, None);
+        let buf: GrowableSceneBuffer<u32> =
+            GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, None);
 
         buf.reserve(&queue, 500).expect("reserve");
         assert!(buf.capacity() >= 500);
@@ -266,15 +345,21 @@ mod tests {
 
         // Every write in the reserved batch must land with zero further growth.
         for row in 0..500u32 {
-            buf.write_row_growing(&queue, row, &[row]).expect("within reserved capacity");
+            buf.write_row_growing(&queue, row, &[row])
+                .expect("within reserved capacity");
         }
-        assert_eq!(buf.epoch(), epoch_after_reserve, "a fully-reserved batch must trigger no further reallocation");
+        assert_eq!(
+            buf.epoch(),
+            epoch_after_reserve,
+            "a fully-reserved batch must trigger no further reallocation"
+        );
     }
 
     #[test]
     fn shrink_to_fit_reclaims_capacity_through_the_dispatch_trait() {
         let (device, queue) = test_device();
-        let buf: GrowableSceneBuffer<u32> = GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, None);
+        let buf: GrowableSceneBuffer<u32> =
+            GrowableSceneBuffer::new(Arc::clone(&device), "test", 2, None);
         buf.write_row_growing(&queue, 999, &[42]).expect("grow");
         let grown_capacity = buf.capacity();
 
@@ -286,6 +371,9 @@ mod tests {
 
         let mut bytes = Vec::new();
         buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, 1000 * 4));
-        assert_eq!(u32::from_ne_bytes(bytes[999 * 4..999 * 4 + 4].try_into().unwrap()), 42);
+        assert_eq!(
+            u32::from_ne_bytes(bytes[999 * 4..999 * 4 + 4].try_into().unwrap()),
+            42
+        );
     }
 }

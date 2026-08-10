@@ -105,9 +105,11 @@ impl GpuColumnSet for TestMaterial {
     fn gpu_columns() -> Vec<GpuColumnDesc> {
         vec![GpuColumnDesc {
             field_token: TypeToken::of::<TestMaterial>(),
+            value_token: TypeToken::of::<TestMaterial>(),
             field_offset: 0,
             mode: MirrorMode::DirtyTracked,
             buffer_name: "test-materials",
+            buffer_key: None,
         }]
     }
 
@@ -145,9 +147,11 @@ impl GpuColumnSet for TestLight {
     fn gpu_columns() -> Vec<GpuColumnDesc> {
         vec![GpuColumnDesc {
             field_token: TypeToken::of::<TestLight>(),
+            value_token: TypeToken::of::<TestLight>(),
             field_offset: 0,
             mode: MirrorMode::DirtyTracked,
             buffer_name: "test-lights",
+            buffer_key: None,
         }]
     }
 

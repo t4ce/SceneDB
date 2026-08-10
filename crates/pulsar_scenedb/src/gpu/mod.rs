@@ -13,14 +13,16 @@
 
 mod assets;
 mod buffer;
+mod component_presence;
 mod context;
 mod dirty;
 mod dirty_tracked_scene_buffer;
 mod dynamic_buffer;
-mod growable_scene_buffer;
 mod generation;
 mod grid;
+mod growable_scene_buffer;
 mod harvest;
+mod once_scene_buffer;
 mod phase;
 mod region;
 mod scatter_write;
@@ -32,31 +34,40 @@ pub mod world_mirror;
 pub use assets::{
     ArenaError, ClusterBuffer, ClusterError, ClusterNode, GeometryArena, MaterialError,
     MaterialRegistry, MaterialRow, MeshError, MeshMetadata, MeshRegistry, MeshletBuffer,
-    MeshletEntry, MeshletError, TextureError, TextureStore, MAX_TEXTURE_SLOTS,
+    MeshletEntry, MeshletError, TextureError, TextureStore, GEOMETRY_INDEX_BUFFER_KEY,
+    GEOMETRY_VERTEX_BUFFER_KEY, MAX_TEXTURE_SLOTS,
 };
 pub use buffer::{GpuBufferDispatch, SceneBuffer, SyncStats, GAP_MERGE_THRESHOLD};
+pub use component_presence::ComponentPresenceBuffer;
 pub use context::EngineGpuContext;
 pub use dirty::DirtyMask;
 pub use dirty_tracked_scene_buffer::{DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer};
 pub use dynamic_buffer::{CapacityError, DynamicGpuBuffer};
-pub use growable_scene_buffer::{GrowableGpuBufferDispatch, GrowableSceneBuffer};
 pub use generation::GenerationBuffer;
 pub use grid::{
     execute_transitions, BudgetError, CellCoord, Domain, GridConfig, StreamingBudget,
     StreamingGrid, Transition, TransitionStats,
 };
+pub use growable_scene_buffer::{GrowableGpuBufferDispatch, GrowableSceneBuffer};
 pub use harvest::{
     revalidate_run, HarvestLease, HarvestPipeline, HarvestStaging, HarvestStats, MeshClass, View,
 };
-pub use phase::{BoundaryPhase, CompactedPhase, FrameDriver, HarvestPhase, RetiredPhase, SimulateA, SimulateB, SimulateWitness};
-pub use region::{RegionPool, RegionError};
+pub use once_scene_buffer::{OnceGpuBufferDispatch, OnceSceneBuffer};
+pub use phase::{
+    BoundaryPhase, CompactedPhase, FrameDriver, HarvestPhase, RetiredPhase, SimulateA, SimulateB,
+    SimulateWitness,
+};
+pub use region::{RegionError, RegionPool};
 pub use scene_store::{
     CellId, CellSlot, GpuColumnDesc, GpuColumnSet, MirrorMode, RegionClassConfig, SceneGpuConfig,
     SceneGpuStore,
 };
 pub use tracker::SubmissionTracker;
 pub use view_upload::ViewTokenBuffers;
-pub use world_mirror::{write_gpu_columns_at_row, GenerationMirror, GpuMirrorHandle, GpuMirrorRegistration};
+pub use world_mirror::{
+    gpu_column_descs_for_component, write_gpu_columns_at_row, DescriptorsFn, GenerationMirror,
+    GpuMirrorHandle, GpuMirrorRegistration,
+};
 // `InstanceInfo` is defined graphics-free in `crate::spatial` (CONTRACTS C0)
 // and already re-exported at the crate root; re-exported here too so GPU-
 // adjacent consumers (e.g. Helio's `helio-scenedb` seam reflection harness,

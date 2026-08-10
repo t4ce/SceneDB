@@ -55,8 +55,12 @@ pub fn generate_gpu_column_set(
     // is DirtyTracked." Validated here, at macro-expansion time, as a real
     // diagnostic (not a macro-execution-time panic).
     if is_packed {
-        let all_once = gpu_fields.iter().all(|f| f.mirror_mode == MirrorModeAttr::Once);
-        let all_dirty_tracked = gpu_fields.iter().all(|f| f.mirror_mode == MirrorModeAttr::DirtyTracked);
+        let all_once = gpu_fields
+            .iter()
+            .all(|f| f.mirror_mode == MirrorModeAttr::Once);
+        let all_dirty_tracked = gpu_fields
+            .iter()
+            .all(|f| f.mirror_mode == MirrorModeAttr::DirtyTracked);
         if !all_once && !all_dirty_tracked {
             return quote! {
                 compile_error!(
@@ -68,7 +72,10 @@ pub fn generate_gpu_column_set(
             };
         }
     }
-    let packed_is_once = is_packed && gpu_fields.iter().all(|f| f.mirror_mode == MirrorModeAttr::Once);
+    let packed_is_once = is_packed
+        && gpu_fields
+            .iter()
+            .all(|f| f.mirror_mode == MirrorModeAttr::Once);
 
     // Every `#[gpu]` field is stored (and registered as a GPU buffer) under
     // its own generated wrapper type, not its raw field type -- see
@@ -80,7 +87,15 @@ pub fn generate_gpu_column_set(
         .map(|f| {
             let field_name = f.ident.to_string();
             let field_ident = &f.ident;
-            let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let field_ty = &f.ty;
+            let wrapper = f
+                .gpu_wrapper
+                .as_ref()
+                .expect("gpu field has a wrapper ident");
+            let buffer_key = match f.gpu_buffer_key() {
+                Some(name) => quote! { Some(#name) },
+                None => quote! { None },
+            };
             let mirror_mode = match f.mirror_mode {
                 MirrorModeAttr::DirtyTracked => {
                     quote! { ::pulsar_scenedb::MirrorMode::DirtyTracked }
@@ -92,9 +107,11 @@ pub fn generate_gpu_column_set(
             quote! {
                 ::pulsar_scenedb::GpuColumnDesc {
                     field_token: ::pulsar_scenedb::token::TypeToken::of::<#wrapper>(),
+                    value_token: ::pulsar_scenedb::token::TypeToken::of::<#field_ty>(),
                     field_offset: ::std::mem::offset_of!(#name, #field_ident),
                     mode: #mirror_mode,
                     buffer_name: #field_name,
+                    buffer_key: #buffer_key,
                 }
             }
         })
@@ -105,7 +122,10 @@ pub fn generate_gpu_column_set(
         .map(|f| {
             let field_name = f.ident.to_string();
             let field_ident = &f.ident;
-            let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let wrapper = f
+                .gpu_wrapper
+                .as_ref()
+                .expect("gpu field has a wrapper ident");
             quote! {
                 #field_name => {
                     let row = cell.row_of(handle).unwrap_or_else(|| {
@@ -125,36 +145,40 @@ pub fn generate_gpu_column_set(
         .iter()
         .map(|f| {
             let field_name = f.ident.to_string();
-            let buffer_label = format!("{}::{}", name, field_name);
-            let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let buffer_label = f
+                .gpu_buffer_key()
+                .map(|key| key.value())
+                .unwrap_or_else(|| format!("{}::{}", name, field_name));
+            let wrapper = f
+                .gpu_wrapper
+                .as_ref()
+                .expect("gpu field has a wrapper ident");
             quote! {
                 store.register_gpu_buffer::<#wrapper>(capacity, device, #buffer_label);
             }
         })
         .collect();
 
-    // Per field, registered through the dirty-tracked path regardless of
-    // its declared `#[gpu(mirror = ...)]` mode (SceneDB#39): `Once` and
-    // `DirtyTracked` fields both need `World::flush_gpu_mirror` to actually
-    // have something registered to flush -- they differ only in HOW OFTEN
-    // `write_gpu_columns_at_row` marks a row dirty at all (`Once`: just the
-    // first insert; `DirtyTracked`: every insert), not in which map they
-    // live in or how the flush itself works. Reusing one proven,
-    // read-lock-first write path for both, instead of a separate immediate
-    // or hand-rolled-pending-queue mechanism for `Once`, is deliberate --
-    // see `GenerationMirror`'s doc (`gpu::world_mirror`, SceneDB crate) for
-    // why an earlier, more "obviously cheap" alternative measured worse in
-    // practice. Never sets a `max_capacity` ceiling -- see
-    // `register_gpu_columns_growable`'s own doc for why that's deliberate
-    // for World-mirrored columns.
+    // DirtyTracked retains a row-indexed CPU shadow for arbitrary updates;
+    // Once uses a transient handoff queue which is discarded after flush.
+    // Keeping those registrations distinct is the memory contract promised
+    // by MirrorMode::Once, not merely an implementation detail.
     let register_growable_calls: Vec<_> = gpu_fields
         .iter()
         .map(|f| {
             let field_name = f.ident.to_string();
-            let buffer_label = format!("{}::{}", name, field_name);
+            let buffer_label = f
+                .gpu_buffer_key()
+                .map(|key| key.value())
+                .unwrap_or_else(|| format!("{}::{}", name, field_name));
             let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
-            quote! {
-                store.register_dirty_tracked_gpu_buffer::<#wrapper>(initial_capacity, device, #buffer_label);
+            match f.mirror_mode {
+                MirrorModeAttr::DirtyTracked => quote! {
+                    store.register_dirty_tracked_gpu_buffer::<#wrapper>(initial_capacity, device, #buffer_label);
+                },
+                MirrorModeAttr::Once => quote! {
+                    store.register_once_gpu_buffer::<#wrapper>(initial_capacity, device, #buffer_label);
+                },
             }
         })
         .collect();
@@ -169,6 +193,127 @@ pub fn generate_gpu_column_set(
     // submits no registration at all, so `World::insert` for it is exactly
     // one `HashMap` miss when a mirror is attached, nothing when it isn't.
     let mirror_dispatch_fn_name = quote::format_ident!("__scenedb_gpu_mirror_dispatch_{}", name);
+    let mirror_clear_fn_name = quote::format_ident!("__scenedb_gpu_mirror_clear_{}", name);
+    let mirror_descriptors_fn_name =
+        quote::format_ident!("__scenedb_gpu_mirror_descriptors_{}", name);
+    let mirror_descriptors_fn_default = quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #mirror_descriptors_fn_name() -> Vec<::pulsar_scenedb::GpuColumnDesc> {
+            <#name #ty_generics as ::pulsar_scenedb::GpuColumnSet>::gpu_columns()
+        }
+    };
+
+    // Hot World-mutation dispatch is emitted field-by-field. Do not route
+    // through `GpuColumnSet::gpu_columns()` here: that reflection API owns a
+    // Vec and is appropriate at registration/editor boundaries, not on every
+    // `World::insert`. Each DirtyTracked field compares exactly the bytes it
+    // would upload against the old component's corresponding field; Once
+    // fields keep their presence-lifetime gate and never compare on ordinary
+    // updates.
+    let mirror_dispatch_fields: Vec<_> = gpu_fields
+        .iter()
+        .map(|f| {
+            let field_ident = &f.ident;
+            let wrapper = f
+                .gpu_wrapper
+                .as_ref()
+                .expect("gpu field has a wrapper ident");
+            match f.mirror_mode {
+                MirrorModeAttr::DirtyTracked => quote! {
+                    {
+                        let value = &data.#field_ident;
+                        let bytes: &[u8] =
+                            ::pulsar_scenedb::bytemuck::bytes_of(value);
+                        let changed = first_handoff || match old_data {
+                            Some(old_data) => {
+                                let old_value = &old_data.#field_ident;
+                                let old_bytes: &[u8] =
+                                    ::pulsar_scenedb::bytemuck::bytes_of(old_value);
+                                old_bytes != bytes
+                            }
+                            None => true,
+                        };
+                        if changed {
+                            ::pulsar_scenedb::gpu::world_mirror::write_gpu_column_bytes_at_row(
+                                mirror.store(),
+                                mirror.queue(),
+                                row,
+                                ::pulsar_scenedb::component::component_id::<#wrapper>(),
+                                ::pulsar_scenedb::MirrorMode::DirtyTracked,
+                                bytes,
+                                first_handoff,
+                            );
+                        }
+                    }
+                },
+                MirrorModeAttr::Once => quote! {
+                    if first_handoff {
+                        let value = &data.#field_ident;
+                        let bytes: &[u8] =
+                            ::pulsar_scenedb::bytemuck::bytes_of(value);
+                        ::pulsar_scenedb::gpu::world_mirror::write_gpu_column_bytes_at_row(
+                            mirror.store(),
+                            mirror.queue(),
+                            row,
+                            ::pulsar_scenedb::component::component_id::<#wrapper>(),
+                            ::pulsar_scenedb::MirrorMode::Once,
+                            bytes,
+                            true,
+                        );
+                    }
+                },
+            }
+        })
+        .collect();
+
+    let register_world_owner_calls: Vec<_> = gpu_fields
+        .iter()
+        .map(|f| {
+            let wrapper = f
+                .gpu_wrapper
+                .as_ref()
+                .expect("gpu field has a wrapper ident");
+            quote! {
+                store.register_world_gpu_column_owner(
+                    owner_component_id,
+                    ::pulsar_scenedb::component::component_id::<#wrapper>(),
+                );
+            }
+        })
+        .collect();
+
+    let mirror_clear_fields: Vec<_> = gpu_fields
+        .iter()
+        .map(|f| {
+            let field_ty = &f.ty;
+            let wrapper = f
+                .gpu_wrapper
+                .as_ref()
+                .expect("gpu field has a wrapper ident");
+            let mirror_mode = match f.mirror_mode {
+                MirrorModeAttr::DirtyTracked => {
+                    quote! { ::pulsar_scenedb::MirrorMode::DirtyTracked }
+                }
+                MirrorModeAttr::Once => quote! { ::pulsar_scenedb::MirrorMode::Once },
+            };
+            quote! {
+                {
+                    let zero: #field_ty =
+                        <#field_ty as ::pulsar_scenedb::bytemuck::Zeroable>::zeroed();
+                    ::pulsar_scenedb::gpu::world_mirror::write_gpu_column_bytes_at_row(
+                        mirror.store(),
+                        mirror.queue(),
+                        row,
+                        ::pulsar_scenedb::component::component_id::<#wrapper>(),
+                        #mirror_mode,
+                        ::pulsar_scenedb::bytemuck::bytes_of(&zero),
+                        true,
+                    );
+                }
+            }
+        })
+        .collect();
 
     // Packed layout (`#[gpu(layout = packed)]`, struct-level): ONE GPU
     // buffer for every `#[gpu]` field combined, instead of the default
@@ -186,6 +331,7 @@ pub fn generate_gpu_column_set(
             quote! { pub #ident: #ty }
         })
         .collect();
+    let packed_field_tys: Vec<_> = gpu_fields.iter().map(|f| &f.ty).collect();
     let packed_field_idents: Vec<_> = gpu_fields.iter().map(|f| f.ident.clone()).collect();
     let packed_view_def = quote! {
         // Field-for-field copy of every #[gpu] field on #name, in
@@ -198,46 +344,116 @@ pub fn generate_gpu_column_set(
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
         #[repr(C)]
-        #[derive(Clone, Copy)]
+        #[derive(
+            Clone,
+            Copy,
+            ::pulsar_scenedb::bytemuck::Zeroable,
+            ::pulsar_scenedb::bytemuck::Pod,
+        )]
         pub struct #packed_view_ident {
             #(#packed_field_defs),*
         }
         unsafe impl ::pulsar_scenedb::page::Pod for #packed_view_ident {}
+        const _: () = {
+            // A shader row is compared and uploaded byte-for-byte. Any
+            // implicit repr(C) gap would be uninitialized, so require users
+            // to model shader padding as explicit #[gpu] fields instead.
+            assert!(
+                ::std::mem::size_of::<#packed_view_ident>()
+                    == 0usize #(+ ::std::mem::size_of::<#packed_field_tys>())*,
+                concat!(
+                    "#[gpu(layout = packed)] generated an implicitly padded shader row for ",
+                    stringify!(#name),
+                    "; add explicit #[gpu] padding fields so every byte is initialized",
+                ),
+            );
+        };
     };
 
-    // SceneDB#39: registered through the dirty-tracked path regardless of
-    // `packed_is_once` -- see the non-packed `register_growable_calls`'s
-    // comment above for why both modes share one registration + write path
-    // now.
     let register_growable_calls_packed = {
         let buffer_label = format!("{}::packed", name);
-        quote! {
-            store.register_dirty_tracked_gpu_buffer::<#packed_view_ident>(initial_capacity, device, #buffer_label);
+        if packed_is_once {
+            quote! {
+                store.register_once_gpu_buffer::<#packed_view_ident>(initial_capacity, device, #buffer_label);
+            }
+        } else {
+            quote! {
+                store.register_dirty_tracked_gpu_buffer::<#packed_view_ident>(initial_capacity, device, #buffer_label);
+            }
         }
     };
 
-    // Packed write body: `Once` marks dirty only on the first insert (skips
-    // entirely on a later update, matching the non-packed Once behavior
-    // exactly) and never again; `DirtyTracked` marks dirty on every insert.
-    // Both then flush identically via `World::flush_gpu_mirror` --
-    // `packed_is_once` was validated uniform across every #[gpu] field on
-    // this struct above.
-    let packed_write_body = if packed_is_once {
+    let packed_mirror_mode = if packed_is_once {
+        quote! { ::pulsar_scenedb::MirrorMode::Once }
+    } else {
+        quote! { ::pulsar_scenedb::MirrorMode::DirtyTracked }
+    };
+    let packed_dispatch_body = if packed_is_once {
         quote! {
-            if !is_new_insert {
-                return;
+            if first_handoff {
+                let packed = #packed_view_ident {
+                    #(#packed_field_idents: data.#packed_field_idents),*
+                };
+                let bytes: &[u8] = ::pulsar_scenedb::bytemuck::bytes_of(&packed);
+                ::pulsar_scenedb::gpu::world_mirror::write_gpu_column_bytes_at_row(
+                    mirror.store(),
+                    mirror.queue(),
+                    row,
+                    ::pulsar_scenedb::component::component_id::<#packed_view_ident>(),
+                    ::pulsar_scenedb::MirrorMode::Once,
+                    bytes,
+                    true,
+                );
             }
-            store.mark_gpu_row_dirty(id, row, bytes);
         }
     } else {
         quote! {
-            let _ = is_new_insert; // DirtyTracked packed columns re-mark on every insert, first or not
-            store.mark_gpu_row_dirty(id, row, bytes);
+            let packed = #packed_view_ident {
+                #(#packed_field_idents: data.#packed_field_idents),*
+            };
+            let bytes: &[u8] = ::pulsar_scenedb::bytemuck::bytes_of(&packed);
+            let changed = first_handoff || match old_data {
+                Some(old_data) => {
+                    let old_packed = #packed_view_ident {
+                        #(#packed_field_idents: old_data.#packed_field_idents),*
+                    };
+                    let old_bytes: &[u8] =
+                        ::pulsar_scenedb::bytemuck::bytes_of(&old_packed);
+                    old_bytes != bytes
+                }
+                None => true,
+            };
+            if changed {
+                ::pulsar_scenedb::gpu::world_mirror::write_gpu_column_bytes_at_row(
+                    mirror.store(),
+                    mirror.queue(),
+                    row,
+                    ::pulsar_scenedb::component::component_id::<#packed_view_ident>(),
+                    ::pulsar_scenedb::MirrorMode::DirtyTracked,
+                    bytes,
+                    first_handoff,
+                );
+            }
+        }
+    };
+    let mirror_descriptors_fn_packed = quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #mirror_descriptors_fn_name() -> Vec<::pulsar_scenedb::GpuColumnDesc> {
+            vec![::pulsar_scenedb::GpuColumnDesc {
+                field_token: ::pulsar_scenedb::token::TypeToken::of::<#packed_view_ident>(),
+                value_token: ::pulsar_scenedb::token::TypeToken::of::<#packed_view_ident>(),
+                field_offset: 0,
+                mode: #packed_mirror_mode,
+                buffer_name: "packed",
+                buffer_key: None,
+            }]
         }
     };
 
     let world_mirror_registration_packed = quote! {
         #packed_view_def
+        #mirror_descriptors_fn_packed
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -245,13 +461,20 @@ pub fn generate_gpu_column_set(
             mirror: &::pulsar_scenedb::gpu::GpuMirrorHandle,
             row: u32,
             data: *const (),
-            is_new_insert: bool,
+            old_data: Option<*const ()>,
+            first_handoff: bool,
         ) {
             // SAFETY: same contract as the non-packed dispatch fn below --
             // `data` is guaranteed to point at a live, correctly-aligned
             // `#name` (the sole caller, `World::insert_inner`, only reaches
             // this via `#name`'s own `ComponentId`).
             let data = unsafe { &*(data as *const #name #ty_generics) };
+            let old_data = old_data.map(|old_data| {
+                // SAFETY: `World::insert_inner` supplies this only for an
+                // existing value from #name's own archetype column and keeps
+                // that value live and unmoved until dispatch returns.
+                unsafe { &*(old_data as *const #name #ty_generics) }
+            });
             // Assembled via ordinary field access, NOT a raw byte-offset
             // read from `&#name` -- #name's own field layout is compiler-
             // chosen (no repr(C) forced on it) and may interleave #[gpu]
@@ -259,36 +482,51 @@ pub fn generate_gpu_column_set(
             // not generally contiguous within #name itself. Building a
             // fresh #packed_view_ident value by name is what makes packed
             // layout correct regardless of #name's actual layout.
-            let packed = #packed_view_ident {
-                #(#packed_field_idents: data.#packed_field_idents),*
-            };
-            let bytes: &[u8] = unsafe {
-                ::std::slice::from_raw_parts(
-                    &packed as *const #packed_view_ident as *const u8,
-                    ::std::mem::size_of::<#packed_view_ident>(),
-                )
-            };
-            let id = ::pulsar_scenedb::component::component_id::<#packed_view_ident>();
-            let store = mirror.store();
-            #packed_write_body
+            #packed_dispatch_body
+        }
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #mirror_clear_fn_name(
+            mirror: &::pulsar_scenedb::gpu::GpuMirrorHandle,
+            row: u32,
+        ) {
+            // SAFETY: the generated packed view implements SceneDB Pod, whose
+            // contract guarantees that all-zero is a valid value.
+            let zero = unsafe { ::std::mem::zeroed::<#packed_view_ident>() };
+            let bytes: &[u8] = ::pulsar_scenedb::bytemuck::bytes_of(&zero);
+            ::pulsar_scenedb::gpu::world_mirror::write_gpu_column_bytes_at_row(
+                mirror.store(),
+                mirror.queue(),
+                row,
+                ::pulsar_scenedb::component::component_id::<#packed_view_ident>(),
+                #packed_mirror_mode,
+                bytes,
+                true,
+            );
         }
 
         ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
             ::pulsar_scenedb::gpu::GpuMirrorRegistration {
                 component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
+                descriptors: #mirror_descriptors_fn_name,
                 dispatch: #mirror_dispatch_fn_name,
+                clear: #mirror_clear_fn_name,
             }
         }
     };
 
     let world_mirror_registration_default = quote! {
+        #mirror_descriptors_fn_default
+
         #[doc(hidden)]
         #[allow(non_snake_case)]
         fn #mirror_dispatch_fn_name(
             mirror: &::pulsar_scenedb::gpu::GpuMirrorHandle,
             row: u32,
             data: *const (),
-            is_new_insert: bool,
+            old_data: Option<*const ()>,
+            first_handoff: bool,
         ) {
             // SAFETY: the sole caller, `World::insert_inner`, only reaches
             // this function by looking it up under `#name`'s own
@@ -298,27 +536,65 @@ pub fn generate_gpu_column_set(
             // so `data` is guaranteed to point at a live, correctly-aligned
             // `#name`.
             let data = unsafe { &*(data as *const #name #ty_generics) };
-            ::pulsar_scenedb::gpu::world_mirror::write_gpu_columns_at_row(
-                mirror.store(),
-                mirror.queue(),
-                row,
-                data,
-                is_new_insert,
-            );
+            let old_data = old_data.map(|old_data| {
+                // SAFETY: `World::insert_inner` supplies this only for an
+                // existing value from #name's own archetype column and keeps
+                // that value live and unmoved until dispatch returns.
+                unsafe { &*(old_data as *const #name #ty_generics) }
+            });
+            #(#mirror_dispatch_fields)*
+        }
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #mirror_clear_fn_name(
+            mirror: &::pulsar_scenedb::gpu::GpuMirrorHandle,
+            row: u32,
+        ) {
+            #(#mirror_clear_fields)*
         }
 
         ::pulsar_scenedb::pulsar_reflection::inventory::submit! {
             ::pulsar_scenedb::gpu::GpuMirrorRegistration {
                 component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
+                descriptors: #mirror_descriptors_fn_name,
                 dispatch: #mirror_dispatch_fn_name,
+                clear: #mirror_clear_fn_name,
             }
         }
     };
 
     let (register_growable_calls, world_mirror_registration) = if is_packed {
-        (vec![register_growable_calls_packed], world_mirror_registration_packed)
+        (
+            vec![register_growable_calls_packed],
+            world_mirror_registration_packed,
+        )
     } else {
         (register_growable_calls, world_mirror_registration_default)
+    };
+
+    let register_growable_descs = if is_packed {
+        quote! {
+            store.register_gpu_column_descs(#mirror_descriptors_fn_name());
+        }
+    } else {
+        quote! {
+            store.register_gpu_column_descs(
+                <Self as ::pulsar_scenedb::GpuColumnSet>::gpu_columns()
+            );
+        }
+    };
+    let register_world_owners = if is_packed {
+        quote! {
+            store.register_world_gpu_column_owner(
+                owner_component_id,
+                ::pulsar_scenedb::component::component_id::<#packed_view_ident>(),
+            );
+        }
+    } else {
+        quote! {
+            #(#register_world_owner_calls)*
+        }
     };
 
     // Only emitted for packed types: the packed view struct is intentionally
@@ -387,12 +663,16 @@ pub fn generate_gpu_column_set(
                 capacity: u32,
                 device: &::wgpu::Device,
             ) {
+                store.register_gpu_column_descs(
+                    <Self as ::pulsar_scenedb::GpuColumnSet>::gpu_columns()
+                );
                 #(#register_calls)*
             }
 
             /// Growable counterpart to [`Self::register_gpu_columns`] --
             /// for World-mirrored use (`World::attach_gpu_mirror`), where
-            /// the eventual entity count isn't known ahead of time.
+            /// the eventual population of this component isn't known ahead
+            /// of time.
             /// `initial_capacity` only needs to be cheap, not sized for the
             /// eventual world; buffers grow transparently on writes past
             /// their current capacity (`SceneGpuStore::write_row_bytes_growing`,
@@ -400,11 +680,26 @@ pub fn generate_gpu_column_set(
             /// Never sets a `max_capacity` ceiling -- see
             /// `SceneGpuStore::register_growable_gpu_buffer`'s doc for why
             /// that's deliberate for World-mirrored columns specifically.
+            /// A canonical World buffer has exactly one owning component:
+            /// reusing an explicit `buffer = "..."` key from another World
+            /// component is rejected because their independent component-
+            /// local row allocators cannot safely share physical rows.
+            /// Compatible named reuse remains available through fixed
+            /// CellStorage registration, whose row regions are disjoint.
             pub fn register_gpu_columns_growable(
                 store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
                 initial_capacity: u32,
                 device: &::std::sync::Arc<::wgpu::Device>,
             ) {
+                #register_growable_descs
+                let owner_component_id =
+                    ::pulsar_scenedb::component::component_id::<#name #ty_generics>();
+                #register_world_owners
+                store.register_component_presence_buffer(
+                    owner_component_id,
+                    initial_capacity,
+                    concat!(stringify!(#name), "::presence"),
+                );
                 #(#register_growable_calls)*
             }
         }

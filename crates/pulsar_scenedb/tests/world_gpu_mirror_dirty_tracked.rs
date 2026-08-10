@@ -14,7 +14,10 @@
 //! `insert`. "Never touched again after the first insert" still holds --
 //! only *when* that one write actually reaches the GPU changed.
 
-use pulsar_scenedb::gpu::{EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig, SceneGpuStore};
+use pulsar_scenedb::gpu::{
+    EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig,
+    SceneGpuStore,
+};
 use pulsar_scenedb::World;
 use pulsar_scenedb_derive::SceneStore;
 use std::sync::Arc;
@@ -48,7 +51,9 @@ fn readback_u32(ctx: &EngineGpuContext, buf: &wgpu::Buffer, row: u64) -> u32 {
     ctx.queue().submit([enc.finish()]);
     let slice = staging.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    ctx.device().poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    ctx.device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
     let data = slice.get_mapped_range().expect("mapped range").to_vec();
     staging.unmap();
     u32::from_ne_bytes(data.try_into().unwrap())
@@ -56,7 +61,10 @@ fn readback_u32(ctx: &EngineGpuContext, buf: &wgpu::Buffer, row: u64) -> u32 {
 
 fn scene_cfg() -> SceneGpuConfig {
     SceneGpuConfig {
-        classes: vec![RegionClassConfig { capacity: 64, max_resident_cells: 1 }],
+        classes: vec![RegionClassConfig {
+            capacity: 64,
+            max_resident_cells: 1,
+        }],
         tombstone_headroom: 8,
         max_cells_metadata: 16,
     }
@@ -70,6 +78,157 @@ struct MixedModeComponent {
     hp: u32, // DirtyTracked (default) -- changes every frame in a real game
 }
 
+#[derive(SceneStore, Clone, Copy)]
+#[repr(C)]
+struct DifferentialComponent {
+    #[gpu]
+    transform_version: u32,
+    cpu_debug_tag: u32,
+    #[gpu]
+    material_version: u32,
+    #[gpu(mirror = Once)]
+    authored_mesh: u32,
+}
+
+#[derive(SceneStore, Clone, Copy)]
+struct NanComponent {
+    #[gpu]
+    value: f32,
+}
+
+#[test]
+fn in_place_replacement_dirties_only_changed_gpu_fields() {
+    let ctx = test_context();
+    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+    DifferentialComponent::register_gpu_columns_growable(&mut store, 8, ctx.device());
+    let columns = DifferentialComponent::gpu_columns();
+    let authored_mesh_id = columns
+        .iter()
+        .find(|column| column.buffer_name == "authored_mesh")
+        .unwrap()
+        .field_token
+        .id();
+    let store = Arc::new(store);
+
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
+    let entity = world.spawn();
+
+    world.insert(
+        entity,
+        DifferentialComponent {
+            transform_version: 10,
+            cpu_debug_tag: 1,
+            material_version: 20,
+            authored_mesh: 30,
+        },
+    );
+    world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!(store.once_pending_count_for_id(authored_mesh_id), Some(0));
+
+    // An exact replacement has an old component to compare against but no
+    // changed GPU payload, so it must queue no value, presence, or generation
+    // row at all.
+    world.insert(
+        entity,
+        DifferentialComponent {
+            transform_version: 10,
+            cpu_debug_tag: 1,
+            material_version: 20,
+            authored_mesh: 30,
+        },
+    );
+    let unchanged = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((unchanged.ranges, unchanged.bytes), (0, 0));
+
+    // CPU-only state remains authoritative in World but does not touch any
+    // GPU partner.
+    world.insert(
+        entity,
+        DifferentialComponent {
+            transform_version: 10,
+            cpu_debug_tag: 2,
+            material_version: 20,
+            authored_mesh: 30,
+        },
+    );
+    let cpu_only = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((cpu_only.ranges, cpu_only.bytes), (0, 0));
+
+    // Once remains a presence-lifetime handoff, not a value-differential
+    // field. Changing it in place neither queues a second handoff nor dirties
+    // another column.
+    world.insert(
+        entity,
+        DifferentialComponent {
+            transform_version: 10,
+            cpu_debug_tag: 2,
+            material_version: 20,
+            authored_mesh: 999,
+        },
+    );
+    assert_eq!(store.once_pending_count_for_id(authored_mesh_id), Some(0));
+    let once_update = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((once_update.ranges, once_update.bytes), (0, 0));
+
+    // One changed u32 field produces exactly one four-byte dirty row. The
+    // other DirtyTracked column is compared directly and skipped.
+    world.insert(
+        entity,
+        DifferentialComponent {
+            transform_version: 11,
+            cpu_debug_tag: 2,
+            material_version: 20,
+            authored_mesh: 999,
+        },
+    );
+    let one_gpu_field = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((one_gpu_field.ranges, one_gpu_field.bytes), (1, 4));
+}
+
+#[test]
+fn differential_comparison_uses_nan_bits_not_float_equality() {
+    let ctx = test_context();
+    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+    NanComponent::register_gpu_columns_growable(&mut store, 8, ctx.device());
+    let store = Arc::new(store);
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
+    let entity = world.spawn();
+
+    let first_nan = f32::from_bits(0x7fc0_0001);
+    world.insert(entity, NanComponent { value: first_nan });
+    world.flush_gpu_mirror(ctx.queue()).unwrap();
+
+    // NaN != NaN under PartialEq, but an identical shader-row bit pattern is
+    // unchanged and must not upload.
+    world.insert(
+        entity,
+        NanComponent {
+            value: f32::from_bits(0x7fc0_0001),
+        },
+    );
+    let same_payload = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((same_payload.ranges, same_payload.bytes), (0, 0));
+
+    // A distinct NaN payload is a distinct GPU value even though both are
+    // NaN numerically, so it dirties exactly one f32 row.
+    world.insert(
+        entity,
+        NanComponent {
+            value: f32::from_bits(0x7fc0_0002),
+        },
+    );
+    let different_payload = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((different_payload.ranges, different_payload.bytes), (1, 4));
+}
+
 #[test]
 fn once_mode_field_never_rewrites_after_the_first_insert() {
     let ctx = test_context();
@@ -78,32 +237,69 @@ fn once_mode_field_never_rewrites_after_the_first_insert() {
     let store = Arc::new(store);
 
     let mut world = World::new();
-    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
 
     let entity = world.spawn();
-    let row = entity.index() as u64;
 
     let columns = MixedModeComponent::gpu_columns();
     let mesh_id_col = columns.iter().find(|c| c.buffer_name == "mesh_id").unwrap();
     let mesh_id_field_id = mesh_id_col.field_token.id();
 
-    world.insert(entity, MixedModeComponent { mesh_id: 42, hp: 100 });
+    world.insert(
+        entity,
+        MixedModeComponent {
+            mesh_id: 42,
+            hp: 100,
+        },
+    );
+    let row = world
+        .gpu_row::<MixedModeComponent>(entity)
+        .expect("component GPU row") as u64;
+    assert_eq!(
+        store.once_pending_count_for_id(mesh_id_field_id),
+        Some(1),
+        "Once keeps only a transient pending handoff, not a capacity-sized CPU shadow",
+    );
     // SceneDB#39: Once-mode writes are now queued, not immediate -- a flush
     // is required before this reaches the GPU, same as DirtyTracked fields.
-    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
+    world
+        .flush_gpu_mirror(ctx.queue())
+        .expect("mirror attached");
     let mut got = 0u32;
-    store.with_dirty_tracked_buffer_for_id(mesh_id_field_id, &mut |buf| got = readback_u32(&ctx, buf, row));
-    assert_eq!(got, 42, "Once field must have written by the first flush after its first insert");
+    store.with_once_buffer_for_id(mesh_id_field_id, &mut |buf| {
+        got = readback_u32(&ctx, buf, row)
+    });
+    assert_eq!(
+        got, 42,
+        "Once field must have written by the first flush after its first insert"
+    );
+    assert_eq!(store.once_pending_count_for_id(mesh_id_field_id), Some(0));
 
     // Re-insert (an in-place update -- entity already has this component):
     // mesh_id changes in the CPU-side value, but the GPU buffer must NOT
     // reflect it -- Once means "queued once at the first insert and never
     // touched again," not "immune to flush timing."
-    world.insert(entity, MixedModeComponent { mesh_id: 999, hp: 50 });
-    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
+    world.insert(
+        entity,
+        MixedModeComponent {
+            mesh_id: 999,
+            hp: 50,
+        },
+    );
+    world
+        .flush_gpu_mirror(ctx.queue())
+        .expect("mirror attached");
     let mut got_after = 0u32;
-    store.with_dirty_tracked_buffer_for_id(mesh_id_field_id, &mut |buf| got_after = readback_u32(&ctx, buf, row));
-    assert_eq!(got_after, 42, "Once field must NOT re-write on a later update, even though the CPU value changed");
+    store.with_once_buffer_for_id(mesh_id_field_id, &mut |buf| {
+        got_after = readback_u32(&ctx, buf, row)
+    });
+    assert_eq!(
+        got_after, 42,
+        "Once field must NOT re-write on a later update, even though the CPU value changed"
+    );
 }
 
 #[test]
@@ -114,17 +310,38 @@ fn dirty_tracked_field_defers_until_flush_gpu_mirror() {
     let store = Arc::new(store);
 
     let mut world = World::new();
-    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
 
     let entity = world.spawn();
-    let row = entity.index() as u64;
-    let hp_field_id = MixedModeComponent::gpu_columns().iter().find(|c| c.buffer_name == "hp").unwrap().field_token.id();
+    let hp_field_id = MixedModeComponent::gpu_columns()
+        .iter()
+        .find(|c| c.buffer_name == "hp")
+        .unwrap()
+        .field_token
+        .id();
 
-    world.insert(entity, MixedModeComponent { mesh_id: 1, hp: 100 });
+    world.insert(
+        entity,
+        MixedModeComponent {
+            mesh_id: 1,
+            hp: 100,
+        },
+    );
+    let row = world
+        .gpu_row::<MixedModeComponent>(entity)
+        .expect("component GPU row") as u64;
 
     let mut before_flush = 0u32;
-    store.with_dirty_tracked_buffer_for_id(hp_field_id, &mut |buf| before_flush = readback_u32(&ctx, buf, row));
-    assert_eq!(before_flush, 0, "DirtyTracked field must NOT be on the GPU yet -- insert alone must not reach it");
+    store.with_dirty_tracked_buffer_for_id(hp_field_id, &mut |buf| {
+        before_flush = readback_u32(&ctx, buf, row)
+    });
+    assert_eq!(
+        before_flush, 0,
+        "DirtyTracked field must NOT be on the GPU yet -- insert alone must not reach it"
+    );
 
     // Several updates before any flush -- only the LAST value should matter
     // once flushed, and only ONE upload should be needed regardless of how
@@ -133,12 +350,19 @@ fn dirty_tracked_field_defers_until_flush_gpu_mirror() {
     world.insert(entity, MixedModeComponent { mesh_id: 1, hp: 60 });
     world.insert(entity, MixedModeComponent { mesh_id: 1, hp: 42 });
 
-    let stats = world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
+    let stats = world
+        .flush_gpu_mirror(ctx.queue())
+        .expect("mirror attached");
     assert!(stats.ranges >= 1, "flush must have uploaded something");
 
     let mut after_flush = 0u32;
-    store.with_dirty_tracked_buffer_for_id(hp_field_id, &mut |buf| after_flush = readback_u32(&ctx, buf, row));
-    assert_eq!(after_flush, 42, "flush must upload the LATEST value, not an intermediate one");
+    store.with_dirty_tracked_buffer_for_id(hp_field_id, &mut |buf| {
+        after_flush = readback_u32(&ctx, buf, row)
+    });
+    assert_eq!(
+        after_flush, 42,
+        "flush must upload the LATEST value, not an intermediate one"
+    );
 
     // A second flush with nothing newly dirty must be a true no-op.
     let stats2 = world.flush_gpu_mirror(ctx.queue()).unwrap();
@@ -154,35 +378,45 @@ fn dirty_tracked_writes_across_multiple_entities_coalesce_on_flush() {
     let store = Arc::new(store);
 
     let mut world = World::new();
-    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
 
-    let hp_field_id = MixedModeComponent::gpu_columns().iter().find(|c| c.buffer_name == "hp").unwrap().field_token.id();
+    let hp_field_id = MixedModeComponent::gpu_columns()
+        .iter()
+        .find(|c| c.buffer_name == "hp")
+        .unwrap()
+        .field_token
+        .id();
 
     // 5 adjacent entities (rows 0..5) -- must coalesce into ONE range.
     let mut entities = Vec::new();
     for i in 0..5u32 {
         let e = world.spawn();
-        world.insert(e, MixedModeComponent { mesh_id: 0, hp: i * 10 });
+        world.insert(
+            e,
+            MixedModeComponent {
+                mesh_id: 0,
+                hp: i * 10,
+            },
+        );
         entities.push(e);
     }
     let stats = world.flush_gpu_mirror(ctx.queue()).unwrap();
-    // 2, not 1: `flush_gpu_mirror`'s returned `SyncStats` is a combined total
-    // across every deferred World-mirrored column (SceneDB#39), and
-    // `MixedModeComponent` has two -- `hp` (DirtyTracked) AND `mesh_id`
-    // (Once, batched since #39). The 5 adjacent rows coalesce into exactly
-    // one range EACH: one for `hp`'s DirtyTracked flush, one for `mesh_id`'s
-    // batched-once flush (every one of the 5 inserts below is each entity's
-    // first, so `mesh_id` queues a write for every row too). Asserting on
-    // the combined total here is what actually exercises coalescing across
-    // BOTH deferred paths at once, not a looser check.
+    // One coalesced range each for hp, mesh_id, component presence, and
+    // entity generation. Lifecycle validity uploads are intentionally part
+    // of the returned total rather than hidden bookkeeping.
     assert_eq!(
-        stats.ranges, 2,
-        "5 adjacent dirty rows must coalesce into exactly one upload range per deferred column (hp + mesh_id)"
+        stats.ranges, 4,
+        "5 adjacent rows must coalesce once per value and validity column"
     );
 
     for (i, e) in entities.iter().enumerate() {
         let mut got = 0u32;
-        store.with_dirty_tracked_buffer_for_id(hp_field_id, &mut |buf| got = readback_u32(&ctx, buf, e.index() as u64));
+        store.with_dirty_tracked_buffer_for_id(hp_field_id, &mut |buf| {
+            got = readback_u32(&ctx, buf, e.index() as u64)
+        });
         assert_eq!(got, (i as u32) * 10);
     }
 }

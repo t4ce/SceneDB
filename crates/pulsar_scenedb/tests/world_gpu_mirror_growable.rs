@@ -1,20 +1,17 @@
 //! Proves growth end-to-end through the World-mirror `Once`-mode path: a
 //! `#[gpu(mirror = Once)]`-tagged component, registered via the derive's
 //! generated `register_gpu_columns_growable` (a small initial capacity, no
-//! `max_capacity` ceiling), survives `World::insert`s at entity indices far
-//! past that initial capacity -- the exact scenario `SceneBuffer`'s
-//! fixed-capacity contract guarantees eventually panics on, without this.
+//! `max_capacity` ceiling), survives enough component-local row allocations
+//! to grow far past that initial capacity.
 //!
-//! As of SceneDB#39, `Once`-mode fields are registered through the SAME
-//! dirty-tracked path `#[gpu]` (`DirtyTracked`) fields use (see
-//! `gpu::world_mirror::GenerationMirror`'s doc for why) -- so growth here is
-//! `DirtyTrackedSceneBuffer`'s growth, verified through
-//! `with_dirty_tracked_buffer_for_id`, not `growable_capacity_for_id`/
-//! `with_growable_buffer_for_id` (those stay accurate for columns registered
-//! via `register_growable_gpu_buffer` directly, which `Once`-mode fields no
-//! longer are).
+//! `Once` uses its own transient handoff path: the GPU allocation grows as
+//! needed, but flushed values are not retained in a capacity-sized CPU
+//! shadow. This test therefore reads through `with_once_buffer_for_id`.
 
-use pulsar_scenedb::gpu::{EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig, SceneGpuStore};
+use pulsar_scenedb::gpu::{
+    EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig,
+    SceneGpuStore,
+};
 use pulsar_scenedb::World;
 use pulsar_scenedb_derive::SceneStore;
 use std::sync::Arc;
@@ -48,7 +45,9 @@ fn readback(ctx: &EngineGpuContext, buf: &wgpu::Buffer, src_offset: u64, bytes: 
     ctx.queue().submit([enc.finish()]);
     let slice = staging.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    ctx.device().poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    ctx.device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
     let data = slice.get_mapped_range().expect("mapped range").to_vec();
     staging.unmap();
     data
@@ -56,7 +55,10 @@ fn readback(ctx: &EngineGpuContext, buf: &wgpu::Buffer, src_offset: u64, bytes: 
 
 fn scene_cfg() -> SceneGpuConfig {
     SceneGpuConfig {
-        classes: vec![RegionClassConfig { capacity: 64, max_resident_cells: 1 }],
+        classes: vec![RegionClassConfig {
+            capacity: 64,
+            max_resident_cells: 1,
+        }],
         tombstone_headroom: 8,
         max_cells_metadata: 16,
     }
@@ -64,9 +66,8 @@ fn scene_cfg() -> SceneGpuConfig {
 
 // #[gpu(mirror = Once)], not the plain #[gpu] (DirtyTracked) default -- this
 // test is specifically about growth through the Once path end-to-end. The
-// underlying growth mechanism is shared with DirtyTracked fields (both go
-// through DirtyTrackedSceneBuffer as of #39); DirtyTracked's own dedicated
-// coverage lives in tests/world_gpu_mirror_dirty_tracked.rs.
+// DirtyTracked's own dedicated coverage lives in
+// tests/world_gpu_mirror_dirty_tracked.rs.
 #[derive(SceneStore, Clone, Copy)]
 struct GrowableTagComponent {
     #[gpu(mirror = Once)]
@@ -83,7 +84,10 @@ fn world_insert_past_initial_capacity_does_not_panic_and_reads_back_correctly() 
     let store = Arc::new(store);
 
     let mut world = World::new();
-    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
 
     // Spawn far more entities than the initial capacity of 2.
     let mut entities = Vec::new();
@@ -96,7 +100,9 @@ fn world_insert_past_initial_capacity_does_not_panic_and_reads_back_correctly() 
     // SceneDB#39: Once-mode writes (and the growth they can trigger) are now
     // deferred to `flush_gpu_mirror`, not immediate on `insert` -- same as
     // DirtyTracked fields.
-    world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
+    world
+        .flush_gpu_mirror(ctx.queue())
+        .expect("mirror attached");
 
     let columns = GrowableTagComponent::gpu_columns();
     assert_eq!(columns.len(), 1);
@@ -104,25 +110,31 @@ fn world_insert_past_initial_capacity_does_not_panic_and_reads_back_correctly() 
 
     // Growth verified by the underlying wgpu::Buffer's actual byte size
     // (capacity in elements = size / 4 for this u32 field) rather than a
-    // dedicated epoch/capacity accessor -- `Once`-mode columns live in the
-    // dirty-tracked map now, which (deliberately) exposes buffer access the
-    // same lock-safe way growable columns do, but doesn't duplicate every
-    // introspection accessor growable columns happen to have.
+    // Once-specific accessor, whose lock covers the reallocatable handle.
     let mut buf_bytes = Vec::new();
     let mut capacity_bytes = 0u64;
-    store.with_dirty_tracked_buffer_for_id(id, &mut |buf| {
+    store.with_once_buffer_for_id(id, &mut |buf| {
         capacity_bytes = buf.size();
         buf_bytes = readback(&ctx, buf, 0, capacity_bytes);
     });
     let capacity = capacity_bytes / 4;
-    assert!(capacity > 2, "must have grown past the initial capacity of 2, got {capacity}");
+    assert!(
+        capacity > 2,
+        "must have grown past the initial capacity of 2, got {capacity}"
+    );
 
     // Every entity's value must still be correct after however many
     // reallocations happened along the way.
     for (i, entity) in entities.iter().enumerate() {
-        let row = entity.index() as usize;
+        let row = world
+            .gpu_row::<GrowableTagComponent>(*entity)
+            .expect("component GPU row") as usize;
         let got = u32::from_ne_bytes(buf_bytes[row * 4..row * 4 + 4].try_into().unwrap());
-        assert_eq!(got, (i as u32) * 7, "row {row} (entity #{i}) must survive every intervening growth");
+        assert_eq!(
+            got,
+            (i as u32) * 7,
+            "row {row} (entity #{i}) must survive every intervening growth"
+        );
     }
 }
 

@@ -1,8 +1,8 @@
-use proc_macro2::TokenStream;
+use std::collections::HashMap;
+
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::{
-    parse::Parse, Data, DeriveInput, Fields, Ident, Type,
-};
+use syn::{parse::Parse, Data, DeriveInput, Fields, Ident, LitStr, Type};
 
 use crate::cell::generate_scene_column_set;
 use crate::gpu::generate_gpu_column_set;
@@ -11,6 +11,10 @@ use crate::gpu::generate_gpu_column_set;
 
 pub struct GpuAttr {
     pub mirror_mode: Option<MirrorModeAttr>,
+    /// Explicit renderer-facing identity for this field's destination GPU
+    /// buffer. Kept as a `LitStr` so code generation emits a true
+    /// `&'static str`, rather than constructing an owned name at runtime.
+    pub buffer_key: Option<LitStr>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -21,24 +25,58 @@ pub enum MirrorModeAttr {
 
 impl Parse for GpuAttr {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        if input.is_empty() {
-            return Ok(GpuAttr { mirror_mode: None });
-        }
-        let _: Ident = input.parse()?;
-        let _: syn::Token![=] = input.parse()?;
-        let mode: Ident = input.parse()?;
-        let mode = match mode.to_string().as_str() {
-            "DirtyTracked" => MirrorModeAttr::DirtyTracked,
-            "Once" => MirrorModeAttr::Once,
-            _ => {
-                return Err(syn::Error::new(
-                    mode.span(),
-                    "expected DirtyTracked or Once",
-                ))
+        let mut mirror_mode = None;
+        let mut buffer_key = None;
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            let _: syn::Token![=] = input.parse()?;
+
+            if key == "mirror" {
+                if mirror_mode.is_some() {
+                    return Err(syn::Error::new(key.span(), "duplicate `mirror` option"));
+                }
+                let mode: Ident = input.parse()?;
+                mirror_mode = Some(match mode.to_string().as_str() {
+                    "DirtyTracked" => MirrorModeAttr::DirtyTracked,
+                    "Once" => MirrorModeAttr::Once,
+                    _ => {
+                        return Err(syn::Error::new(
+                            mode.span(),
+                            "expected DirtyTracked or Once",
+                        ))
+                    }
+                });
+            } else if key == "buffer" {
+                if buffer_key.is_some() {
+                    return Err(syn::Error::new(key.span(), "duplicate `buffer` option"));
+                }
+                let name: LitStr = input.parse().map_err(|_| {
+                    syn::Error::new(
+                        input.span(),
+                        "expected a string literal (e.g. `buffer = \"general_mesh_buf\"`)",
+                    )
+                })?;
+                if name.value().is_empty() {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        "GPU buffer name cannot be empty",
+                    ));
+                }
+                buffer_key = Some(name);
+            } else {
+                return Err(syn::Error::new(key.span(), "expected `mirror` or `buffer`"));
             }
-        };
+
+            if input.is_empty() {
+                break;
+            }
+            let _: syn::Token![,] = input.parse()?;
+        }
+
         Ok(GpuAttr {
-            mirror_mode: Some(mode),
+            mirror_mode,
+            buffer_key,
         })
     }
 }
@@ -57,18 +95,28 @@ pub struct StructGpuAttr {
 impl Parse for StructGpuAttr {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         if input.is_empty() {
-            return Ok(StructGpuAttr { layout_packed: false });
+            return Ok(StructGpuAttr {
+                layout_packed: false,
+            });
         }
         let key: Ident = input.parse()?;
         if key != "layout" {
-            return Err(syn::Error::new(key.span(), "expected `layout` (e.g. `#[gpu(layout = packed)]`)"));
+            return Err(syn::Error::new(
+                key.span(),
+                "expected `layout` (e.g. `#[gpu(layout = packed)]`)",
+            ));
         }
         let _: syn::Token![=] = input.parse()?;
         let value: Ident = input.parse()?;
         if value != "packed" {
-            return Err(syn::Error::new(value.span(), "expected `packed` -- the only supported layout today"));
+            return Err(syn::Error::new(
+                value.span(),
+                "expected `packed` -- the only supported layout today",
+            ));
         }
-        Ok(StructGpuAttr { layout_packed: true })
+        Ok(StructGpuAttr {
+            layout_packed: true,
+        })
     }
 }
 
@@ -91,11 +139,10 @@ impl Parse for StructGpuAttr {
 /// identically to one without the attribute at all (nothing to pack).
 pub fn struct_is_packed(attrs: &[syn::Attribute]) -> bool {
     // Lenient on parse failure (a bare `#[gpu]` with no `(...)` at all, or
-    // unrecognized content), matching the existing per-field `#[gpu]`
-    // parsing's own tolerance (`scene_store::expand`'s field loop: `if let
-    // Ok(...) = attr.parse_args()`) rather than hard-erroring -- consistent
-    // behavior for the same attribute name used at two different syntactic
-    // positions in this macro.
+    // unrecognized content). This is the historical struct-level behavior;
+    // per-field options are parsed strictly because silently ignoring a
+    // misspelled stable buffer identity would register the wrong physical
+    // column.
     attrs.iter().any(|attr| {
         attr.path().is_ident("gpu")
             && attr
@@ -112,6 +159,13 @@ pub struct FieldInfo {
     pub ty: Type,
     pub is_gpu: bool,
     pub mirror_mode: MirrorModeAttr,
+    /// Optional explicit stable destination key from
+    /// `#[gpu(buffer = "...")]`. `None` preserves the historical behavior:
+    /// the generated wrapper remains this field's private physical identity.
+    /// `GpuColumnDesc::buffer_name` remains the Rust field/display name in
+    /// both cases; the new `buffer_key` metadata is populated only for this
+    /// explicit opt-in, preventing common bare field names from aliasing.
+    pub gpu_buffer_key: Option<LitStr>,
     /// Present iff `is_gpu`. `ComponentId`/`TypeToken` (this crate's GPU
     /// buffer + CPU-column keys) are derived from a Rust `TypeId`, globally
     /// — keyed by the field's own raw type, they carry no notion of which
@@ -135,9 +189,63 @@ pub struct FieldInfo {
     /// and (when the `gpu` feature is on) the `SceneColumnSet`-generated
     /// `CellType` column token. A wrapper's own `TypeId` is unique to its
     /// (struct, field) pair by construction, so two `#[gpu] f32` fields on
-    /// different structs get two distinct, collision-free `ComponentId`s
-    /// even though their underlying data is the same shape.
+    /// different structs get two distinct CPU-column `ComponentId`s even
+    /// though their underlying data is the same shape. An explicit
+    /// `buffer = "..."` may subsequently alias compatible wrappers to one
+    /// canonical GPU allocation through `SceneGpuStore`'s descriptor
+    /// registry; the wrapper identity itself remains stable for CellStorage.
     pub gpu_wrapper: Option<Ident>,
+}
+
+impl FieldInfo {
+    /// Stable cross-component buffer identity, when the field explicitly
+    /// opted into one with `#[gpu(buffer = "...")]`.
+    ///
+    /// A bare `#[gpu]` deliberately returns `None`: ordinary field names
+    /// such as `value` or `position` are display names, not global buffer
+    /// identities. Treating those historical names as keys would make
+    /// unrelated components alias merely because their Rust field names
+    /// happen to match.
+    pub fn gpu_buffer_key(&self) -> Option<&LitStr> {
+        self.gpu_buffer_key.as_ref()
+    }
+}
+
+fn validate_gpu_buffer_names(gpu_fields: &[&FieldInfo], is_packed: bool) -> syn::Result<()> {
+    let mut explicit_names: HashMap<String, Span> = HashMap::new();
+
+    for field in gpu_fields {
+        let Some(name) = field.gpu_buffer_key() else {
+            continue;
+        };
+
+        if is_packed {
+            return Err(syn::Error::new(
+                name.span(),
+                "`#[gpu(buffer = \"...\")]` is not supported with `#[gpu(layout = packed)]`: \
+                 the packed World mirror is one interleaved physical buffer, so a per-field \
+                 name would not identify the buffer that is actually registered",
+            ));
+        }
+
+        if let Some(first_span) = explicit_names.insert(name.value(), name.span()) {
+            let mut error = syn::Error::new(
+                name.span(),
+                format!(
+                    "duplicate GPU buffer name `{}` within one SceneStore type; named fields \
+                     require distinct buffers (packed/grouped named buffers are not supported)",
+                    name.value()
+                ),
+            );
+            error.combine(syn::Error::new(
+                first_span,
+                "first use of this GPU buffer name",
+            ));
+            return Err(error);
+        }
+    }
+
+    Ok(())
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
@@ -170,38 +278,60 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let ty = field.ty.clone();
         let mut is_gpu = false;
         let mut mirror_mode = MirrorModeAttr::DirtyTracked;
+        let mut mirror_mode_explicit = false;
+        let mut gpu_buffer_key = None;
 
         for attr in &field.attrs {
             if attr.path().is_ident("gpu") {
                 is_gpu = true;
-                if let Ok(gpu_attr) = attr.parse_args::<GpuAttr>() {
-                    if let Some(mode) = gpu_attr.mirror_mode {
-                        mirror_mode = mode;
+                // `Attribute::parse_args` intentionally rejects path-only
+                // attributes, so preserve bare `#[gpu]` as the default
+                // DirtyTracked/no-key form and parse strictly only when an
+                // argument list is actually present.
+                let gpu_attr = if matches!(attr.meta, syn::Meta::Path(_)) {
+                    GpuAttr {
+                        mirror_mode: None,
+                        buffer_key: None,
                     }
+                } else {
+                    attr.parse_args::<GpuAttr>()?
+                };
+                if let Some(mode) = gpu_attr.mirror_mode {
+                    if mirror_mode_explicit {
+                        return Err(syn::Error::new_spanned(
+                            attr,
+                            "duplicate `mirror` option across `#[gpu]` attributes",
+                        ));
+                    }
+                    mirror_mode = mode;
+                    mirror_mode_explicit = true;
+                }
+                if let Some(buffer_key) = gpu_attr.buffer_key {
+                    if gpu_buffer_key.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            attr,
+                            "duplicate `buffer` option across `#[gpu]` attributes",
+                        ));
+                    }
+                    gpu_buffer_key = Some(buffer_key);
                 }
             }
         }
 
-        // Not generics-aware (see doc on `gpu_wrapper`'s uniqueness
-        // reasoning): a generic `SceneStore` struct instantiated at two
-        // different type parameters would generate the SAME wrapper ident
-        // for both instantiations. Named `#[derive(SceneStore)]` structs
-        // in practice are concrete GPU-data structs (this crate's own
-        // built-ins included), not generic over their `#[gpu]` fields'
-        // types, so this covers the real cases; a future fix for the
-        // generic case would fold `ty_generics` into the wrapper name.
-        let gpu_wrapper = is_gpu.then(|| {
-            Ident::new(
-                &format!("__ScenedbGpuCol_{}_{}", name, ident),
-                ident.span(),
-            )
-        });
+        // The wrapper ident itself is intentionally unique to (struct,
+        // field). GPU-bearing generic SceneStore types are rejected below:
+        // an ident cannot encode a Rust monomorph, and inventory also needs
+        // a concrete component identity. CPU-only generic types never emit
+        // this wrapper and remain supported.
+        let gpu_wrapper = is_gpu
+            .then(|| Ident::new(&format!("__ScenedbGpuCol_{}_{}", name, ident), ident.span()));
 
         field_infos.push(FieldInfo {
             ident,
             ty,
             is_gpu,
             mirror_mode,
+            gpu_buffer_key,
             gpu_wrapper,
         });
     }
@@ -216,7 +346,26 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let field_types: Vec<&Type> = field_infos.iter().map(|f| &f.ty).collect();
     let gpu_fields: Vec<&FieldInfo> = field_infos.iter().filter(|f| f.is_gpu).collect();
 
-    let pod_impl = generate_pod_impl(name, &impl_generics, &ty_generics, where_clause, &field_types);
+    if !gpu_fields.is_empty() && !input.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &input.generics,
+            "`#[derive(SceneStore)]` does not yet support `#[gpu]` fields on generic structs: \
+             GPU inventory/partner reflection requires a concrete component type, and explicit \
+             per-monomorph registration is not yet provided; use a concrete SceneStore wrapper \
+             or remove `#[gpu]` (generic CPU-only SceneStore types remain supported)",
+        ));
+    }
+
+    let is_packed = struct_is_packed(&input.attrs);
+    validate_gpu_buffer_names(&gpu_fields, is_packed)?;
+
+    let pod_impl = generate_pod_impl(
+        name,
+        &impl_generics,
+        &ty_generics,
+        where_clause,
+        &field_types,
+    );
 
     // Two `SceneColumnSet` impls, `cfg`-split on the `gpu` feature: with it
     // on, `#[gpu]` fields' CellType column tokens must match the wrapper
@@ -245,7 +394,10 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let gpu_wrapper_defs: Vec<TokenStream> = gpu_fields
         .iter()
         .map(|f| {
-            let wrapper = f.gpu_wrapper.as_ref().expect("gpu field has a wrapper ident");
+            let wrapper = f
+                .gpu_wrapper
+                .as_ref()
+                .expect("gpu field has a wrapper ident");
             let ty = &f.ty;
             quote! {
                 // Byte-identical to #ty (repr(transparent), single field) --
@@ -255,14 +407,18 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #[doc(hidden)]
                 #[allow(non_camel_case_types)]
                 #[repr(transparent)]
-                #[derive(Clone, Copy)]
+                #[derive(
+                    Clone,
+                    Copy,
+                    ::pulsar_scenedb::bytemuck::Zeroable,
+                    ::pulsar_scenedb::bytemuck::Pod,
+                )]
                 pub struct #wrapper(pub #ty);
                 unsafe impl ::pulsar_scenedb::page::Pod for #wrapper {}
             }
         })
         .collect();
 
-    let is_packed = struct_is_packed(&input.attrs);
     let gpu_column_set = generate_gpu_column_set(
         name,
         &impl_generics,
@@ -305,12 +461,10 @@ fn generate_pod_impl(
         })
         .collect();
 
-    let mut wc: syn::WhereClause = where_clause
-        .cloned()
-        .unwrap_or_else(|| syn::WhereClause {
-            where_token: Default::default(),
-            predicates: syn::punctuated::Punctuated::new(),
-        });
+    let mut wc: syn::WhereClause = where_clause.cloned().unwrap_or_else(|| syn::WhereClause {
+        where_token: Default::default(),
+        predicates: syn::punctuated::Punctuated::new(),
+    });
 
     for bound in &pod_bounds {
         let pred: syn::WherePredicate = syn::parse_quote! { #bound };
@@ -319,5 +473,123 @@ fn generate_pod_impl(
 
     quote! {
         unsafe impl #impl_generics ::pulsar_scenedb::page::Pod for #name #ty_generics #wc {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn gpu_attr_parses_named_buffer_and_composed_options() {
+        let named: GpuAttr = syn::parse_str(r#"buffer = "general_mesh_buf""#).expect("buffer");
+        assert_eq!(
+            named.buffer_key.as_ref().map(LitStr::value),
+            Some("general_mesh_buf".to_owned())
+        );
+        assert!(named.mirror_mode.is_none());
+
+        let composed: GpuAttr = syn::parse_str(r#"mirror = Once, buffer = "general_mesh_buf","#)
+            .expect("composed options with trailing comma");
+        assert!(matches!(composed.mirror_mode, Some(MirrorModeAttr::Once)));
+        assert_eq!(
+            composed.buffer_key.as_ref().map(LitStr::value),
+            Some("general_mesh_buf".to_owned())
+        );
+
+        let reverse_order: GpuAttr =
+            syn::parse_str(r#"buffer = "general_mesh_buf", mirror = DirtyTracked"#)
+                .expect("options in reverse order");
+        assert!(matches!(
+            reverse_order.mirror_mode,
+            Some(MirrorModeAttr::DirtyTracked)
+        ));
+    }
+
+    #[test]
+    fn gpu_attr_rejects_invalid_or_ambiguous_buffer_options() {
+        for (input, expected) in [
+            (r#"buffer = """#, "GPU buffer name cannot be empty"),
+            ("buffer = general_mesh_buf", "expected a string literal"),
+            (r#"buffer = "a", buffer = "b""#, "duplicate `buffer` option"),
+            (r#"destination = "a""#, "expected `mirror` or `buffer`"),
+        ] {
+            let error = syn::parse_str::<GpuAttr>(input)
+                .err()
+                .unwrap_or_else(|| panic!("`{input}` unexpectedly parsed"));
+            assert!(
+                error.to_string().contains(expected),
+                "`{input}`: expected `{expected}`, got `{error}`"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_rejects_duplicate_explicit_buffer_keys_within_one_type() {
+        let input: DeriveInput = parse_quote! {
+            struct DuplicateNames {
+                #[gpu(buffer = "shared")]
+                first: u32,
+                #[gpu(buffer = "shared")]
+                second: u32,
+            }
+        };
+        let error = expand(input).expect_err("duplicate explicit keys must fail");
+        assert!(error
+            .to_string()
+            .contains("duplicate GPU buffer name `shared`"));
+    }
+
+    #[test]
+    fn bare_field_name_is_not_an_implicit_global_buffer_key() {
+        let input: DeriveInput = parse_quote! {
+            struct ExplicitAndDisplayName {
+                #[gpu(buffer = "second")]
+                first: u32,
+                #[gpu]
+                second: u32,
+            }
+        };
+        expand(input).expect("a bare field name is display metadata, not a shared key");
+    }
+
+    #[test]
+    fn derive_rejects_named_fields_in_packed_world_layout() {
+        let input: DeriveInput = parse_quote! {
+            #[gpu(layout = packed)]
+            struct NamedPacked {
+                #[gpu(buffer = "not_the_actual_packed_buffer")]
+                value: u32,
+            }
+        };
+        let error = expand(input).expect_err("named packed field must fail");
+        assert!(error
+            .to_string()
+            .contains("not supported with `#[gpu(layout = packed)]`"));
+    }
+
+    #[test]
+    fn derive_rejects_gpu_fields_on_generic_scene_store_types() {
+        let input: DeriveInput = parse_quote! {
+            struct GenericGpu<T> {
+                #[gpu(buffer = "generic_values")]
+                value: T,
+            }
+        };
+        let error = expand(input).expect_err("generic GPU identity is not monomorphic");
+        assert!(error
+            .to_string()
+            .contains("GPU inventory/partner reflection requires a concrete component type"));
+    }
+
+    #[test]
+    fn generic_cpu_only_scene_store_types_remain_supported() {
+        let input: DeriveInput = parse_quote! {
+            struct GenericCpu<T: ::pulsar_scenedb::page::Pod + 'static> {
+                value: T,
+            }
+        };
+        expand(input).expect("generic CPU-only SceneStore must remain supported");
     }
 }

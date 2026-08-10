@@ -104,48 +104,55 @@ pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
 pub use cell::CellStorage;
 pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet};
 pub use component::{component_id, Component, ComponentId};
-pub use component_store::{__bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp, ComponentStore};
+pub use component_store::{ComponentStore, __bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp};
 pub use entity::Entity;
 #[cfg(feature = "gpu")]
 pub use gpu::{
-    CapacityError, DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer, DynamicGpuBuffer,
-    GenerationMirror, GpuBufferDispatch, GpuColumnDesc, GpuColumnSet, GpuMirrorHandle,
-    GpuMirrorRegistration, GrowableGpuBufferDispatch, GrowableSceneBuffer, MirrorMode,
+    gpu_column_descs_for_component, CapacityError, DescriptorsFn, DirtyTrackedGpuBufferDispatch,
+    DirtyTrackedSceneBuffer, DynamicGpuBuffer, GenerationMirror, GpuBufferDispatch, GpuColumnDesc,
+    GpuColumnSet, GpuMirrorHandle, GpuMirrorRegistration, GrowableGpuBufferDispatch,
+    GrowableSceneBuffer, MirrorMode,
 };
 // Re-exported so `#[derive(SceneStore)]`'s generated code (which lands in
 // whatever crate uses the derive, not here) can reach `inventory::submit!`
 // via `::pulsar_scenedb::pulsar_reflection::inventory` without that crate
 // needing its own direct `pulsar_reflection` dependency — same reasoning
 // `wgpu` re-exports work by for `#[gpu]` field types.
-pub use pulsar_reflection;
-#[cfg(feature = "gpu")]
-pub use subsystem::{Subsystem, SubsystemRegistry};
-#[cfg(feature = "gpu")]
-pub use scene_db::SceneDb;
 pub use handle::Handle;
-pub use replication::{
-    AuthorityTable, CellRowSnapshot, ChangeTracker, ClientId, ClientInput, ComponentDelta,
-    condition_passes, CpuSimulateWitness, Delta, DeltaCompressor, DeltaView, decode_archetype_key,
-    encode_archetype_key, encode_field_value, encode_pod_raw, EntityCellMap, EntitySnapshot,
-    ErrorCode, EventBatch, EventChannel, FieldDescriptor, Ownership, Reconciler, RelevanceSet,
-    ReplicatedEvent, Replicable, ReplicationCondition, ReplicationEncoding, ReplicationSchema,
-    ReplicationRegistry, SchemaBuilder, Snapshot,
-};
 pub use lease::{Lease, LeaseMask, Scratchpad, DECAY_FRAMES, LEASE_SLOTS};
 pub use liveness::LivenessMask;
 pub use page::{
     Column, ColumnDesc, GenericColumn, LayoutError, Page, PageLayout, Pod, PodColumn,
     DEFAULT_PAGE_CAPACITY, MAX_PAGE_CAPACITY, MAX_STRIDE_BYTES,
 };
+// Generated GPU row wrappers use bytemuck's stronger no-uninitialized-byte
+// Pod contract. Re-export it so downstream macro expansions do not need a
+// direct dependency merely to name the derive traits.
+#[cfg(feature = "gpu")]
+#[doc(hidden)]
+pub use bytemuck;
+pub use pulsar_reflection;
 pub use query::{QueryIter, WorldQuery};
 pub use registry::{HandleRegistry, NULL_ROW};
 pub use relation::{ConflictEntry, ConflictReason, RelationIndex, RelationView};
+pub use replication::{
+    condition_passes, decode_archetype_key, encode_archetype_key, encode_field_value,
+    encode_pod_raw, AuthorityTable, CellRowSnapshot, ChangeTracker, ClientId, ClientInput,
+    ComponentDelta, CpuSimulateWitness, Delta, DeltaCompressor, DeltaView, EntityCellMap,
+    EntitySnapshot, ErrorCode, EventBatch, EventChannel, FieldDescriptor, Ownership, Reconciler,
+    RelevanceSet, Replicable, ReplicatedEvent, ReplicationCondition, ReplicationEncoding,
+    ReplicationRegistry, ReplicationSchema, SchemaBuilder, Snapshot,
+};
+#[cfg(feature = "gpu")]
+pub use scene_db::SceneDb;
 pub use schedule::Schedule;
 pub use snapshot::{LivenessSnapshot, RevocationFlag};
 pub use spatial::{
     Aabb, Frustum, InstanceInfo, SpatialCell, INSTANCE_INFO_COLUMN, SPATIAL_COLUMNS,
     TRANSFORM_COLUMN,
 };
+#[cfg(feature = "gpu")]
+pub use subsystem::{Subsystem, SubsystemRegistry};
 pub use time::GameTime;
 pub use token::{HasTypeToken, TypeToken};
 pub use world::World;

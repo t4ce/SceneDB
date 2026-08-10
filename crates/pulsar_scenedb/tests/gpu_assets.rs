@@ -156,6 +156,40 @@ fn free_then_realloc_reuses_space_after_coalescing() {
 }
 
 #[test]
+fn growable_geometry_preserves_offsets_bytes_and_named_identity() {
+    let ctx = test_context();
+    let mut arena = GeometryArena::new_growable_named(
+        &ctx,
+        16,
+        16,
+        "test.general.vertices",
+        "test.general.indices",
+    );
+
+    let first_buffer = arena.vertex_buffer().clone();
+    let first = arena.upload_vertices(ctx.queue(), &[1u8; 16]).unwrap();
+    let second = arena.upload_vertices(ctx.queue(), &[2u8; 16]).unwrap();
+
+    assert_eq!((first, second), (0, 16), "growth must not relocate live ranges");
+    assert_ne!(arena.vertex_buffer(), &first_buffer, "growth replaces the physical allocation");
+    assert_eq!(arena.vertex_epoch(), 1);
+    assert_eq!(arena.vertex_buffer_key(), "test.general.vertices");
+    assert_eq!(arena.index_buffer_key(), "test.general.indices");
+    assert_eq!(arena.vertex_high_water_bytes(), 32);
+    assert_eq!(
+        readback(&ctx, arena.vertex_buffer(), 32),
+        [vec![1u8; 16], vec![2u8; 16]].concat(),
+    );
+
+    arena.free_vertices(second, 16);
+    assert_eq!(arena.vertex_high_water_bytes(), 16);
+    let reused = arena.upload_vertices(ctx.queue(), &[3u8; 8]).unwrap();
+    assert_eq!(reused, 16);
+    assert_eq!(arena.vertex_epoch(), 1, "free-range reuse needs no allocation growth");
+    assert_eq!(arena.vertex_high_water_bytes(), 24);
+}
+
+#[test]
 fn traditional_and_vg_mesh_registered_byte_exact_in_ssbo() {
     let ctx = test_context();
     let mut reg = MeshRegistry::new(&ctx, 4);
@@ -1074,6 +1108,126 @@ fn unregister_error_paths_do_not_duplicate_the_free_list() {
         store.slot_count(),
         3,
         "d must be a freshly minted slot (extent grows to 3) — a dup-push impl would recycle slot_a twice and leave the extent at 2"
+    );
+}
+
+#[test]
+fn texture_replace_preserves_slot_then_unregister_reuses_it() {
+    let ctx = test_context();
+    let mut store = TextureStore::new(4);
+    let desc = rgba_desc(1, 1);
+    let slot = store
+        .register(ctx.device(), ctx.queue(), &desc, &[10, 20, 30, 40])
+        .expect("initial register");
+
+    store
+        .replace(slot, ctx.device(), ctx.queue(), &desc, &[50, 60, 70, 80])
+        .expect("compatible replacement at the occupied slot");
+    assert_eq!(slot, 0);
+    assert_eq!(store.slot_count(), 1, "replacement must not grow or recycle the slot table");
+    assert_eq!(store.upload_count(), 2);
+    assert_eq!(
+        readback_texture(&ctx, store.texture(slot).unwrap(), 1, 1, 4),
+        [50, 60, 70, 80],
+    );
+
+    store.unregister(slot).expect("remove replacement");
+    let reused = store
+        .register(ctx.device(), ctx.queue(), &desc, &[90, 100, 110, 120])
+        .expect("reuse removed slot");
+    assert_eq!(reused, slot);
+    assert_eq!(store.slot_count(), 1);
+}
+
+#[test]
+fn texture_register_at_restores_sparse_slots_and_rejects_occupied_misuse() {
+    let ctx = test_context();
+    let mut store = TextureStore::new(8);
+    let desc = rgba_desc(1, 1);
+
+    assert_eq!(
+        store
+            .register_at(3, ctx.device(), ctx.queue(), &desc, &[3, 3, 3, 3])
+            .expect("restore retained slot 3"),
+        3,
+    );
+    assert_eq!(store.slot_count(), 4);
+    assert!(store.texture(0).is_none());
+    assert!(store.texture(1).is_none());
+    assert!(store.texture(2).is_none());
+    assert!(store.texture(3).is_some());
+
+    assert_eq!(
+        store.register_at(3, ctx.device(), ctx.queue(), &desc, &[9, 9, 9, 9]),
+        Err(TextureError::SlotOccupied),
+    );
+    assert_eq!(store.upload_count(), 1, "occupied rejection must not upload");
+
+    store
+        .restore_at(1, ctx.device(), ctx.queue(), &desc, &[1, 1, 1, 1])
+        .expect("restore a gap by its exact slot");
+    let recycled_gap = store
+        .register(ctx.device(), ctx.queue(), &desc, &[2, 2, 2, 2])
+        .expect("normal allocation consumes a remaining gap");
+    assert_eq!(recycled_gap, 2);
+    assert_eq!(store.slot_count(), 4);
+    assert_eq!(
+        store.register_at(8, ctx.device(), ctx.queue(), &desc, &[8, 8, 8, 8]),
+        Err(TextureError::SlotOutOfRange),
+    );
+}
+
+#[test]
+fn texture_rebuild_at_is_descriptor_checked_and_transactional() {
+    let ctx = test_context();
+    let mut store = TextureStore::new(4);
+    let desc = rgba_desc(1, 1);
+    let slot = store
+        .register(ctx.device(), ctx.queue(), &desc, &[1, 2, 3, 4])
+        .expect("initial register");
+
+    let incompatible = rgba_desc(2, 1);
+    assert_eq!(
+        store.rebuild_at(
+            slot,
+            ctx.device(),
+            ctx.queue(),
+            &incompatible,
+            &[5, 6, 7, 8, 9, 10, 11, 12],
+        ),
+        Err(TextureError::IncompatibleDescriptor),
+    );
+    assert_eq!(
+        store.rebuild_at(slot, ctx.device(), ctx.queue(), &desc, &[5, 6, 7]),
+        Err(TextureError::InvalidDataLength {
+            expected: 4,
+            actual: 3,
+        }),
+    );
+    assert_eq!(store.upload_count(), 1, "rejected rebuilds must not upload");
+    assert_eq!(
+        readback_texture(&ctx, store.texture(slot).unwrap(), 1, 1, 4),
+        [1, 2, 3, 4],
+        "rejected rebuilds leave the old resident texture live",
+    );
+
+    store
+        .rebuild_at(slot, ctx.device(), ctx.queue(), &desc, &[8, 7, 6, 5])
+        .expect("compatible device-object rebuild");
+    assert_eq!(store.upload_count(), 2);
+    assert_eq!(
+        readback_texture(&ctx, store.texture(slot).unwrap(), 1, 1, 4),
+        [8, 7, 6, 5],
+    );
+
+    store.unregister(slot).expect("make slot vacant");
+    assert_eq!(
+        store.rebuild_at(slot, ctx.device(), ctx.queue(), &desc, &[4, 3, 2, 1]),
+        Err(TextureError::SlotVacant),
+    );
+    assert_eq!(
+        store.rebuild_at(3, ctx.device(), ctx.queue(), &desc, &[4, 3, 2, 1]),
+        Err(TextureError::SlotOutOfRange),
     );
 }
 

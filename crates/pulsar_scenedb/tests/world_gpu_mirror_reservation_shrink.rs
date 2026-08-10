@@ -6,7 +6,10 @@
 //! reachable at realistic AAA scale (a 256-byte packed row hits the default
 //! 256 MiB limit at 1,048,576 rows in one buffer), not a theoretical case.
 
-use pulsar_scenedb::gpu::{EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig, SceneGpuStore};
+use pulsar_scenedb::gpu::{
+    EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig,
+    SceneGpuStore,
+};
 use pulsar_scenedb::World;
 use pulsar_scenedb_derive::SceneStore;
 use std::sync::Arc;
@@ -30,7 +33,10 @@ fn test_context() -> EngineGpuContext {
 
 fn scene_cfg() -> SceneGpuConfig {
     SceneGpuConfig {
-        classes: vec![RegionClassConfig { capacity: 64, max_resident_cells: 1 }],
+        classes: vec![RegionClassConfig {
+            capacity: 64,
+            max_resident_cells: 1,
+        }],
         tombstone_headroom: 8,
         max_cells_metadata: 16,
     }
@@ -49,7 +55,10 @@ fn reserve_eliminates_reallocations_across_a_batch_spawn() {
     ReserveTestComponent::register_gpu_columns_growable(&mut store, 4, ctx.device());
     let store = Arc::new(store);
     let mut world = World::new();
-    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
 
     let id = ReserveTestComponent::gpu_columns()[0].field_token.id();
 
@@ -62,14 +71,22 @@ fn reserve_eliminates_reallocations_across_a_batch_spawn() {
     // must have grown the dirty-tracked map's buffer, not the growable one.
     let mut epoch_before = None;
     store.with_dirty_tracked_buffer_for_id(id, &mut |_| epoch_before = Some(()));
-    assert!(epoch_before.is_some(), "reserve must have registered/grown the dirty-tracked buffer");
+    assert!(
+        epoch_before.is_some(),
+        "reserve must have registered/grown the dirty-tracked buffer"
+    );
 
     for i in 0..1000u32 {
         let e = world.spawn();
         world.insert(e, ReserveTestComponent { value: i });
     }
-    let stats = world.flush_gpu_mirror(ctx.queue()).expect("mirror attached");
-    assert_eq!(stats.ranges, 1, "1000 contiguous rows, pre-reserved -- one coalesced flush range, zero growth mid-batch");
+    let stats = world
+        .flush_gpu_mirror(ctx.queue())
+        .expect("mirror attached");
+    assert_eq!(
+        stats.ranges, 3,
+        "1000 contiguous rows coalesce once each for value, component presence, and entity generation",
+    );
 }
 
 #[test]
@@ -79,7 +96,10 @@ fn shrink_reclaims_capacity_after_a_peak_then_drop() {
     ReserveTestComponent::register_gpu_columns_growable(&mut store, 4, ctx.device());
     let store = Arc::new(store);
     let mut world = World::new();
-    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
 
     // Peak: spawn 1000, mostly despawn them.
     let mut entities = Vec::new();
@@ -110,12 +130,17 @@ fn shrink_reclaims_capacity_after_a_peak_then_drop() {
         ctx.queue().submit([enc.finish()]);
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-        ctx.device().poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        ctx.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
         got = slice.get_mapped_range().expect("mapped range").to_vec();
         staging.unmap();
     });
     for i in 0..10usize {
-        assert_eq!(u32::from_ne_bytes(got[i * 4..i * 4 + 4].try_into().unwrap()), i as u32);
+        assert_eq!(
+            u32::from_ne_bytes(got[i * 4..i * 4 + 4].try_into().unwrap()),
+            i as u32
+        );
     }
 }
 
@@ -134,8 +159,16 @@ fn capacity_ceiling_is_a_catchable_error_not_a_process_crash() {
     ReserveTestComponent::register_gpu_columns_growable(&mut store, 4, ctx.device());
     let store = Arc::new(store);
     let mut world = World::new();
-    world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.queue())));
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
 
-    let result = world.reserve_gpu_mirror_capacity(ctx.queue(), u32::MAX).expect("mirror attached");
-    assert!(result.is_err(), "an absurd reservation must come back as Err, not panic the process");
+    let result = world
+        .reserve_gpu_mirror_capacity(ctx.queue(), u32::MAX)
+        .expect("mirror attached");
+    assert!(
+        result.is_err(),
+        "an absurd reservation must come back as Err, not panic the process"
+    );
 }

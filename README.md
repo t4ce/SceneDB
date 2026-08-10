@@ -164,17 +164,15 @@ SceneDB provides a suite of derive macros that generate Pod implementations, GPU
 
 ### `#[derive(SceneStore)]` — Pod + GPU dispatch + storage location
 
-The workhorse macro defined in `pulsar_scenedb_derive`. Generates `Pod` impl, `SceneColumnSet` (column layout), `GpuColumnSet` (GPU write dispatch), and `MirrorMode` wiring. Apply to any `repr(C)` struct:
+The workhorse macro defined in `pulsar_scenedb_derive`. Generates a `Pod` impl, `SceneColumnSet` (column layout), `GpuColumnSet` (GPU write dispatch), and `MirrorMode` wiring. Every field must itself implement SceneDB's narrow `Pod` trait, and the resulting type must be `Copy`. A field marked `#[gpu]` additionally must implement bytemuck's `Pod + Zeroable`: differential World dispatch compares the exact shader-row bytes, so implicit/uninitialized padding is rejected at compile time rather than spuriously dirtying a row or invoking undefined behavior. Packed layouts also assert that the generated row size equals the sum of its fields; represent shader padding with explicit `#[gpu]` padding fields. The built-in fixed-size array implementation is `[f32; 16]`; `[f32; 2/3/4]`, `[u8; N]`, and arbitrary arrays are not SceneDB `Pod` merely because their elements are. Use scalar fields, `[f32; 16]`, or a reviewed local newtype with an explicit `unsafe impl Pod` whose all-zero representation is valid. `repr(C)` is strongly recommended for any type whose bytes cross an FFI/GPU boundary; the derive does not prove an arbitrary CPU-only struct has no padding.
 
 ```rust
 use pulsar_scenedb_derive::SceneStore;
 
-#[derive(SceneStore)]
+#[derive(SceneStore, Clone, Copy)]
 #[repr(C)]
 pub struct Transform {
-    pub position: [f32; 3],
-    pub rotation: [f32; 4],
-    pub scale: [f32; 3],
+    pub matrix: [f32; 16],
 }
 ```
 
@@ -194,10 +192,41 @@ Every field lives in CPU SoA columns by default. Adding `#[gpu]` creates an addi
 | `#[gpu]` | Yes | Yes | `DirtyTracked` | Per-frame transforms, instance data |
 | `#[gpu(mirror = DirtyTracked)]` | Yes | Yes | Per-frame dirty tracking | Explicit form of bare `#[gpu]` |
 | `#[gpu(mirror = Once)]` | Yes | Yes | Upload once, never re-sync | Static geometry, constant buffers |
+| `#[gpu(buffer = "general_mesh_buf")]` | Yes | Yes | `DirtyTracked` + stable named destination | Sharing one compatible renderer buffer across component paths |
 
-The actual parser accepts the form `#[gpu(mirror = DirtyTracked)]` and `#[gpu(mirror = Once)]`. Bare `#[gpu]` defaults to `DirtyTracked`. The underlying `MirrorMode` enum (`pulsar_scenedb::gpu::MirrorMode`) has two variants — `DirtyTracked` and `Once`.
+The options compose in either order: for example, `#[gpu(mirror = Once, buffer = "general_mesh_buf")]`. Bare `#[gpu]` defaults to `DirtyTracked`. The underlying `MirrorMode` enum (`pulsar_scenedb::gpu::MirrorMode`) has two variants — `DirtyTracked` and `Once`.
 
 Fields **without** `#[gpu]` stay CPU-only — they consume no VRAM, generate no dirty words in `SceneGpuStore`, and never participate in delta-sync. They DO participate in replication (via `#[replicate]`), spatial queries, and everything else on the CPU side.
+
+`buffer = "..."` is an identity, not merely a debug label. The derive emits
+it as `GpuColumnDesc::buffer_key` together with the raw field type's
+`value_token`; registration maps each component-local wrapper column to the
+same canonical GPU allocation when an explicit key is reused through fixed
+CellStorage. That path is safe because cells occupy disjoint physical row
+regions. Reuse is accepted only when row type/layout/stride, mirror mode, and
+residency mode are compatible; an incompatible registration is rejected
+instead of silently replacing an existing buffer. Growable World registration
+is stricter: one canonical buffer has exactly one owning component type,
+because two components on the same entity would otherwise race with silent
+last-write-wins semantics at the same row. Give those World components
+distinct keys or consolidate the shader row into one component. A bare
+`#[gpu]` has no global key —
+its `buffer_name` remains useful display/reflection metadata, but common Rust
+field names such as `value` or `position` never alias by accident.
+
+Within one non-packed type, explicit keys must be unique. Explicit per-field
+keys are currently rejected on `#[gpu(layout = packed)]` types because that
+World path registers one interleaved physical row, not one buffer per named
+field; a future packed/group key needs metadata for that actual combined
+layout rather than pretending a field key names it.
+
+Generic CPU-only `SceneStore` structs remain supported, subject to the normal
+`Pod + 'static` bounds for stored field types. A generic struct with any
+`#[gpu]` field is a compile error: the link-time World inventory and GPU
+partner registry require one concrete component identity, and SceneDB does
+not yet expose explicit registration per monomorph. Use a concrete wrapper
+for GPU-mirrored data rather than letting multiple monomorphs share an
+ambiguous generated wrapper/registration.
 
 ```rust
 use pulsar_scenedb_derive::SceneStore;
@@ -205,11 +234,11 @@ use pulsar_scenedb_derive::SceneStore;
 /// A material component with mixed storage locations:
 ///   - color, roughness, metallic → CPU + GPU (dirty-tracked mirror)
 ///   - name → CPU only (no GPU mirror, no VRAM cost)
-#[derive(SceneStore)]
+#[derive(SceneStore, Clone, Copy)]
 #[repr(C)]
 pub struct Material {
     #[gpu]                              // CPU + GPU, DirtyTracked
-    pub albedo: [f32; 4],
+    pub albedo_rgba8: u32,
 
     #[gpu(mirror = DirtyTracked)]        // CPU + GPU, explicit
     pub roughness: f32,
@@ -218,7 +247,7 @@ pub struct Material {
     pub metallic: f32,
 
     // No #[gpu] — CPU only. No VRAM, no dirty tracking.
-    pub name: [u8; 64],
+    pub name_hash: u64,
 }
 ```
 
@@ -302,7 +331,7 @@ world.insert(entity, InstanceComponent { model, mesh_id, material_id, flags, loc
 // reasoning as the per-field #[gpu] wrapper types) -- reach it by
 // ComponentId instead:
 let id = InstanceComponent::packed_gpu_component_id();
-store.with_growable_buffer_for_id(id, &mut |buf| {
+store.with_dirty_tracked_buffer_for_id(id, &mut |buf| {
     // bind `buf` into a bind group, exactly like any other wgpu::Buffer
 });
 ```
@@ -576,8 +605,8 @@ impl Component for Health {}
 
 let mut registry = ReplicationRegistry::new();
 
-// `[[f32; 4]; 4]` isn't `Pod` in this crate (only `[f32; 16]`/`[f32; 2/3/4]`
-// are provided) — for a hand-registered (non-derive) type like this, either
+// `[[f32; 4]; 4]` isn't `Pod` in this crate (the built-in fixed-size array
+// implementation is `[f32; 16]`) — for a hand-registered type like this, either
 // mark it `unsafe impl Pod for Transform {}` yourself if it's safe to
 // byte-reinterpret, or implement `Replicable` directly.
 unsafe impl pulsar_scenedb::Pod for Transform {}
@@ -972,7 +1001,7 @@ let view = index.view();
 
 Everything in [Macro system](#macro-system) above ties a `#[gpu]` field to `CellStorage`/`Handle` — the paged storage layer, not the archetype ECS `World` uses. That's a real gap: a component like `StaticMeshComponent { mesh: MeshHandle }` attached to a `World` entity has no path to the GPU at all through `write_gpu`, which requires a `Handle` `World` doesn't have.
 
-`World::attach_gpu_mirror` closes that gap. Once attached, `World::insert`/`insert_tracked` automatically mirrors any `#[gpu]` field of the inserted component to its registered GPU buffer, at row = `entity.index()` — no `CellStorage`, no `Handle`, no separate mirror-aware insert call:
+`World::attach_gpu_mirror` closes that gap. Once attached, `World::insert`/`insert_tracked` automatically mirrors any `#[gpu]` field of the inserted component to its registered GPU buffer at a stable component-local row — no `CellStorage`, no `Handle`, no separate mirror-aware insert call. Resolve that row with `world.gpu_row::<T>(entity)` or `GpuMirrorHandle::gpu_row::<T>(entity)`; it is deliberately not `entity.index()`:
 
 ```rust
 use pulsar_scenedb::{World, Entity};
@@ -989,7 +1018,7 @@ struct StaticMeshComponent {
 
 // Setup, once:
 let mut store = SceneGpuStore::new(&ctx, cfg);
-StaticMeshComponent::register_gpu_columns(&mut store, world_capacity, ctx.device());
+StaticMeshComponent::register_gpu_columns_growable(&mut store, 1024, ctx.device());
 let store = Arc::new(store);
 
 let mut world = World::new();
@@ -998,9 +1027,12 @@ world.attach_gpu_mirror(GpuMirrorHandle::new(Arc::clone(&store), Arc::clone(ctx.
 // Usage — an ordinary insert, nothing mirror-specific about the call site:
 let entity = world.spawn();
 world.insert(entity, StaticMeshComponent { mesh: 42, lod_bias: 0.0 });
-// `mesh` is now on the GPU, in its own dense buffer, at row = entity.index().
+let row = world.gpu_row::<StaticMeshComponent>(entity).unwrap();
+// `mesh` is now on the GPU, in its component-local buffer, at `row`.
 // Re-inserting (updating) the component re-mirrors the new value the same way.
 ```
+
+Each GPU-bearing component type has an independent row domain. Rows remain stable for that exact `Entity` + component-presence lifetime, released rows are recycled without moving survivors, and the span is bounded by that component's peak concurrent population rather than the World's global entity high-water mark. This is why a first light can occupy light row 0 even when its `Entity::index()` is 500,000. Public `Entity` handles and generations do not change.
 
 Nothing about the macro surface changes: `#[derive(SceneStore)]` and `#[gpu]` are exactly what they are everywhere else in this document. Skip `attach_gpu_mirror` and `World` behaves exactly as it always has — this is opt-in, and a `--no-default-features` build never sees any of it (CONTRACTS C0).
 
@@ -1008,7 +1040,7 @@ Nothing about the macro surface changes: `#[derive(SceneStore)]` and `#[gpu]` ar
 
 The actual mechanism: `#[derive(SceneStore)]` additionally emits, for any type with at least one `#[gpu]` field, a small **non-generic** dispatch function (`T` already concrete at macro-expansion time) and submits it — via `inventory::submit!`, the same link-time registration mechanism `SubsystemRegistry`/`DynMethodRegistry` already use elsewhere in this document — keyed by the type's `ComponentId`. `World::insert` looks that registration up using the `ComponentId` it already computes for archetype indexing (no extra `TypeId` resolution over what `insert` already pays today), and calls the dispatch function if one was found. A type with no `#[gpu]` fields never submits a registration, so its insert path costs exactly one `HashMap` miss when a mirror is attached, and nothing at all when it isn't.
 
-**Capacity.** `register_gpu_columns(store, capacity, device)` (fixed) is never reallocated, matching `SceneBuffer`'s own contract — `capacity` must cover every `Entity::index()` the world will ever reach, and a write past it panics. For World-mirrored columns, whose eventual entity count is rarely known ahead of time, use `register_gpu_columns_growable(store, initial_capacity, device)` instead — same generated method, growable buffer, same `world.insert()` call site:
+**Capacity and lifecycle registration.** `register_gpu_columns(store, capacity, device)` is the fixed, CellStorage-oriented registration path. It intentionally does not allocate World component-presence buffers, so using it through an attached `World` mirror fails loudly instead of silently claiming generic removal safety. World-mirrored components must use `register_gpu_columns_growable(store, initial_capacity, device)`: this registers growable value buffers plus the owning component's explicit presence/tombstone buffer.
 
 ```rust
 // Note the &Arc<wgpu::Device>, not &wgpu::Device -- the growable buffer
@@ -1016,12 +1048,22 @@ The actual mechanism: `#[derive(SceneStore)]` additionally emits, for any type w
 StaticMeshComponent::register_gpu_columns_growable(&mut store, 1024, &device);
 ```
 
-`initial_capacity` only needs to be cheap to allocate — the buffer doubles (with a GPU-to-GPU copy of existing rows) transparently the first time an insert's `entity.index()` doesn't fit, entirely inside `World::insert`'s automatic dispatch, with no caller-visible difference from the fixed path except that it never panics on capacity. `SceneGpuStore::register_growable_gpu_buffer` (the lower-level method this generated call wraps) can also take an explicit `max_capacity` ceiling for a deliberate VRAM budget, but the derive's generated `register_gpu_columns_growable` never sets one — a World-mirrored column hitting a capacity ceiling has no way to report that failure back through `world.insert()`, so the recommendation is to leave it unbounded and rely on `DynamicGpuBuffer`/`GrowableSceneBuffer`'s `epoch()` counter (see `SceneGpuStore::growable_epoch_for_id`) if you need to observe growth for bind-group invalidation purposes.
+`initial_capacity` only needs to be cheap to allocate — the buffer doubles (with a GPU-to-GPU copy of existing rows) transparently the first time that component's local row doesn't fit, entirely inside `World::insert`'s automatic dispatch. `SceneGpuStore::register_growable_gpu_buffer` (the lower-level method this generated call wraps) can also take an explicit `max_capacity` ceiling for a deliberate VRAM budget, but the derive's generated `register_gpu_columns_growable` never sets one — a World-mirrored column hitting a capacity ceiling has no way to report that failure back through `world.insert()`, so the recommendation is to leave it unbounded and rely on the buffer epoch returned by `gpu_buffer_snapshot_for_id`/`gpu_buffer_snapshot_for_key` for bind-group invalidation.
 
 **Mirror mode.** `register_gpu_columns_growable` routes each `#[gpu]` field through one of two registrations, chosen by its declared `#[gpu(mirror = ...)]` mode — the same attribute documented earlier for the cell-mirrored path, now also honored here:
 
-- **`#[gpu(mirror = Once)]`** — written on the entity's first insert of this component, and never again, even if the component is later re-inserted (updating some other field). As of #39, this is *also deferred*: `World::insert` queues the write (an O(1) map upsert, no GPU work) instead of uploading immediately, and `world.flush_gpu_mirror(queue)` performs the actual upload, coalesced across every row queued since the last flush — the same shape as `DirtyTracked` below, just without a persistent per-row CPU shadow (a `Once` row is never revisited after its first write, so there's nothing to keep once it's flushed). This changed from earlier versions, where `Once` wrote immediately and synchronously on `insert` — real-device benchmarking (Helio#211/SceneDB#39) found spawn/despawn-churn workloads dominated by exactly that per-insert `queue.write_buffer` cost, since `Once` mode is what most spawned-entity data (transforms, mesh ids) actually uses.
+- **`#[gpu(mirror = Once)]`** — handed off once per *component-presence lifetime*. Ordinary in-place updates do not re-upload it; removal queues a zero value tombstone and marks the component absent, and a later re-insertion starts a new lifetime and hands off again. The path is deferred and retains only transient pending `(row, value)` entries until `world.flush_gpu_mirror(queue)`; it does not retain a capacity-sized CPU value shadow after flush. Duplicate lifecycle events for one row in the same frame collapse in order so the final event wins.
 - **plain `#[gpu]` (`DirtyTracked`, the default)** — writes are *deferred*: `World::insert` marks the row dirty (pure CPU bookkeeping, no GPU work at all) instead of uploading immediately. Call `world.flush_gpu_mirror(queue)` once per frame to actually upload every row dirtied since the last flush, coalesced into as few `queue.write_buffer` calls as row adjacency allows — the World-mirror analogue of the cell-mirrored path's own boundary-phase sync:
+
+For an in-place replacement, generated World dispatch compares each
+DirtyTracked field's bytemuck-safe object representation with the old
+component and queues only fields whose shader bytes changed. CPU-only edits
+and unchanged replacements therefore upload zero value rows. A packed layout
+performs one comparison for its one physical row. This is a bitwise contract,
+not Rust `PartialEq`: identical NaN payload bits are unchanged, while two
+different NaN payloads are different GPU values. Dispatch is emitted directly
+per field and does not allocate `gpu_columns()` descriptor vectors on the
+mutation path.
 
 ```rust
 // Every frame, after your simulation/gameplay step (which may call
@@ -1031,34 +1073,43 @@ world.flush_gpu_mirror(&queue);
 
 Skipping the flush means NEITHER `DirtyTracked` NOR `Once` fields reach the GPU — `World::insert` alone is never enough for either, unlike anything registered through the non-growable `register_gpu_columns`. This is the one place World-mirrored fields require an explicit per-frame call; everything else in this section is fully automatic. The liveness/generation mirror (below) is flushed by the same call.
 
-Reading a `DirtyTracked` field's buffer goes through `SceneGpuStore::with_dirty_tracked_buffer_for_id` (the dirty-tracked counterpart to `with_growable_buffer_for_id`/`buffer_for_id`), keyed the same way — `GpuColumnDesc::field_token.id()` from `gpu_columns()`, or `Self::packed_gpu_component_id()` for a packed struct.
+Reading a `DirtyTracked` field's buffer goes through `SceneGpuStore::with_dirty_tracked_buffer_for_id`; `Once` uses `with_once_buffer_for_id`. For renderer bind-group caches, prefer `gpu_buffer_snapshot_for_id`/`gpu_buffer_snapshot_for_key`, which atomically return the current physical handle and allocation epoch. Keys are `GpuColumnDesc::field_token.id()` from `gpu_columns()`, a stable explicit `buffer = "..."` key, or `Self::packed_gpu_component_id()` for a packed struct.
 
 `#[gpu(layout = packed)]` structs (above) require every `#[gpu]` field to share one mirror mode — mixing `Once` and `DirtyTracked` within one packed record is a compile error, since the whole record is written as a single unit and "half of this write is deferred" has no meaning.
 
 **Reservation and shrinking.** Growth is lazy by default — the first insert whose row doesn't fit pays a real GPU-to-GPU copy, wherever that happens to land. Measured cost is not small at scale (Helio#211: ~43ms for a 100k→200k-row reallocation, over 2.5x a 60fps frame budget) — for any batch whose size you know ahead of time (streaming in a sublevel, spawning a wave of enemies), reserve capacity up front instead:
 
 ```rust
-world.reserve_gpu_mirror_capacity(&queue, expected_entity_count)
+world.reserve_gpu_component_capacity::<StaticMeshComponent>(expected_mesh_count)
     .expect("mirror attached")
     .expect("reserve succeeds");
 // every insert() in the batch that follows now costs zero further growth
 ```
 
+The typed form grows only that component's value and presence buffers. Use
+`reserve_gpu_mirror_capacity(&queue, expected_entity_index_span)` only when you
+intentionally want the conservative operation that also grows the global
+generation buffer and every registered World component buffer.
+
 And shrink back down after a peak (a big fight that spawned and despawned thousands of transient entities), at a natural boundary — not every frame, this is a real reallocation too:
 
 ```rust
-world.shrink_gpu_mirror_to_fit(&queue, highest_live_entity_index, 1.5); // 50% slack
+world.shrink_gpu_component_to_fit::<StaticMeshComponent>(1.5); // 50% slack
 ```
+
+This uses the component-local row span tracked by the mirror. The older
+`shrink_gpu_mirror_to_fit` remains available for a deliberate whole-mirror
+shrink and takes the highest live global entity row explicitly.
 
 Growth also now respects the device's own `wgpu::Limits::max_buffer_size` (256 MiB by default) — previously, growth would double past this and `device.create_buffer` would reject it with an unrecoverable `wgpu` validation panic; a 256-byte packed row hits this at 1,048,576 rows in one buffer, well within AAA-relevant entity counts. It now comes back as an ordinary `CapacityError`, the same one an explicit `max_capacity` ceiling already produces — `reserve`/`insert`'s automatic dispatch both surface it (the latter via a panic with a clear message, since `World::insert` has nothing to return a `Result` through — see the "Mirror mode" panic note above for the same reasoning applied here).
 
 **Flush cost.** `world.flush_gpu_mirror`'s scan used to walk every row in a `DirtyTracked` buffer's full capacity to find the dirty ones — a benchmark (Helio#211) found this cost nearly identical whether 0% or 10% of 100,000 rows were dirty (~38.5 µs either way), the scan itself dominating over the actual writes. It now walks only marked rows (`DirtyMask::for_each_marked`, skipping whole all-zero 64-bit words at a time) — `O(capacity/64 + dirty count)` instead of `O(capacity)`, with identical coalescing output (same runs, same upload calls) for the same dirty set.
 
-**Scattered writes (SceneDB#39).** The scan above still coalesces dirty rows into contiguous runs and uploads each run with its own `queue.write_buffer` call — fine when dirty rows cluster, but real churn (entities despawning/respawning keyed by entity index, not spatial or temporal locality) routinely dirties rows scattered roughly uniformly across the whole capacity, where coalescing produces close to one run per row. Measured at 100k entities/10% churn per frame: despawn and insert together cost under 1% of the frame; `flush_gpu_mirror` was the other 99%+, at ~28 ms/frame — roughly 20,000 individual `write_buffer` calls across the two deferred columns involved (an instance-data field plus the liveness/generation mirror), each paying that call's own fixed cost. Above `DirtyTrackedSceneBuffer::SCATTER_RUN_THRESHOLD` (4) contiguous runs, `flush` now switches to a GPU-side scatter-write compute pass instead: every dirty row's index and value are packed into two flat host-side arrays and uploaded in exactly two `queue.write_buffer` calls total, then one compute dispatch scatters each value to its destination row — a constant number of GPU calls regardless of how many rows are dirty or how scattered they are. One pipeline serves every column's element type/size (the shader copies `words_per_element` `u32` words per invocation, that count passed as a uniform), so this costs one pipeline object per `DirtyTrackedSceneBuffer`, not per distinct type. Below the threshold, direct per-run writes still win (scatter's fixed cost — two uploads plus a dispatch — isn't paid back by skipping just a couple of `write_buffer` calls). Measured result at the same 100k/10% churn scenario: `flush_gpu_mirror` dropped from ~28 ms/frame to ~1.4 ms/frame, and total frame cost from ~44 ms to ~8 ms — inside a 60fps frame budget where it previously wasn't.
+**Scattered writes (SceneDB#39).** The scan above still coalesces dirty rows into contiguous runs and uploads each run with its own `queue.write_buffer` call — fine when dirty rows cluster, but real churn can dirty rows scattered across a component's stable local allocation domain, where coalescing produces close to one run per row. Measured at 100k entities/10% churn per frame before component-local rows landed, despawn and insert together cost under 1% of the frame while `flush_gpu_mirror` took ~28 ms/frame from roughly 20,000 individual writes across the instance and generation columns. Above `DirtyTrackedSceneBuffer::SCATTER_RUN_THRESHOLD` (4) contiguous runs, `flush` switches to a GPU-side scatter-write compute pass: every dirty row's index and value are packed into two flat host-side arrays and uploaded in exactly two `queue.write_buffer` calls total, then one compute dispatch scatters each value to its destination row. One pipeline serves every column's element type/size. Below the threshold, direct per-run writes still win because scatter's fixed uploads and dispatch are not paid back by skipping only a couple of calls. In that benchmark, scatter reduced mirror flush from ~28 ms to ~1.4 ms and total frame time from ~44 ms to ~8 ms; component-local allocation additionally removes unrelated component populations from each value buffer's row span.
 
 **Concurrency.** `#[gpu]` (`DirtyTracked`) fields' `mark_dirty` no longer takes an exclusive lock for every mark — the common case (a row that already fits) only needs a shared read lock, so threads marking *disjoint* rows proceed concurrently instead of serializing against each other for no structural reason. One real caveat worth knowing: never call `insert()`/the underlying `mark_dirty` for the *same* row from two threads at once — every real caller already satisfies this naturally (a row is one entity, and `World::insert`'s own `&mut self` signature prevents two threads inserting onto the same entity concurrently one layer up), but it's a genuine precondition, not just an implementation detail. A benchmark pass (Helio#211) found that `GrowableSceneBuffer`'s write path — which already used this same read-lock-first shape — *still* showed per-write cost increasing with thread count, pointing at `wgpu::Queue`'s own internal submission synchronization as a real, separate contributor that no amount of restructuring this crate's own locks removes.
 
-**Staleness / liveness.** Despawning an entity does not clear its row in a mirrored `#[gpu]` component buffer — the same "recycled row may hold a prior tenant's bytes" contract `CellStorage` itself documents elsewhere in this file applies here too. What DOES happen automatically: `World::spawn`/`despawn`/`insert` (when a mirror is attached) keep a dedicated, GPU-resident generation buffer — `GpuMirrorHandle::generations()` — in lockstep with `entity_slots`' own generation for that row, exactly the value `World::is_alive` already checks on the CPU side. As of #39 this is both *deferred* (queued at spawn/insert/despawn, actually uploaded by the next `world.flush_gpu_mirror` call, coalesced the same way `Once`/`DirtyTracked` field writes are) and *gated*: an entity that never receives a `#[gpu]`-bearing component costs nothing here at all, not at spawn and not at despawn — only entities that actually carry GPU-mirrored data get a liveness entry in the first place. This matters because `World::spawn` alone doesn't know yet whether the entity it just created will ever get a `#[gpu]` field; the generation write is queued lazily, the first time (if ever) one actually arrives, not unconditionally on every spawn. A GPU-side reader (a shader, a cull pass) that captured `(row, generation)` at some point — typically alongside the same visible-index/draw list it's iterating — should compare `generation` against `generations_buffer[row]` before trusting any other World-mirrored buffer's contents at `row`:
+**Staleness / liveness.** Two checks are required because they represent different facts and now use different indices. The entity-generation buffer answers “is this still the same entity?” at `entity.index()`; a per-component presence buffer answers “does this component-local row currently contain `T`?” at `gpu_row::<T>(entity)`. Removing `T` leaves the entity generation unchanged, writes `presence_T[component_row] = 0`, and queues zero tombstones for `T`'s value partners. Despawn does those component clears and advances `generations[entity_index]`. All writes are deferred until `world.flush_gpu_mirror`. A projection entry that needs shader-side liveness validation therefore carries both indices (plus the captured generation). Bind presence with `component_presence_buffer_snapshot_for_id(component_id::<T>())` and generation with `GpuMirrorHandle::generations().buffer_snapshot()`:
 
 ```rust
 // Bind mirror.generations() alongside your other World-mirrored buffers:
@@ -1068,17 +1119,16 @@ mirror.generations().with_buffer(&mut |buf| {
 ```
 
 ```wgsl
-// In the consuming shader, given `row` and a `generation` captured earlier
-// alongside it (e.g. from a CPU-side query snapshot, or another buffer
-// written at the same time):
-if (generations[row] != generation) {
+// In the consuming shader, given `entity_index`, `component_row`, and the
+// captured entity generation from one projection entry:
+if (generations[entity_index] != generation || component_presence[component_row] == 0u) {
     return; // stale -- this row's other buffers no longer belong to what we think
 }
 ```
 
-This mirrors `World::is_alive`'s exact CPU-side check, just GPU-resident. It does not, on its own, tell a shader which rows are *currently occupied at all* (that's still the consumer's responsibility, e.g. via a separate visible/active-row list) — it only tells it, for a row it already intends to read, whether the data there still belongs to the entity it thinks it does.
+Generation mirrors `World::is_alive`; presence mirrors ECS component membership. Zeroed value bytes are defense-in-depth, not a generic absence sentinel—a valid mesh/material index may itself be zero—so shaders must not omit the presence check.
 
-**What `#[gpu]` component fields are *not* for.** They give a stable one-row-per-entity buffer, written by `World::insert`, with a lifetime tied to the entity. That shape does not fit every kind of GPU data a renderer built on `World` needs. Before reaching for `#[gpu]`, check:
+**What `#[gpu]` component fields are *not* for.** They give a stable row per present component, written by `World::insert`, with a lifetime tied to that component's presence on an entity. That shape does not fit every kind of GPU data a renderer built on `World` needs. Before reaching for `#[gpu]`, check:
 
 - **Does this data have exactly one meaningful value per entity, for as long as the entity is alive?** A mesh handle, a material index, a light's color — yes. A frame's visible-instance list, a compacted index buffer, indirect draw args — no: their length varies frame to frame and has no entity-stable meaning (`row 7` of a visibility list isn't "entity 7").
 - **Is this data written by `World::insert`, or produced by a compute pass?** `#[gpu]` fields are written CPU-side, on insert. Cull/visibility/compaction outputs are written GPU-side, by a shader, every frame — a completely different producer and a completely different capacity model (sized to visible/drawn count, not entity count).

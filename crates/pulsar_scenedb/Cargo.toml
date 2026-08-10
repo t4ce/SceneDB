@@ -6,7 +6,7 @@ description = "SceneDB 2.0 — engine-wide spatial database (Layer 1 storage cor
 
 [features]
 default = []
-gpu = ["dep:wgpu"]
+gpu = ["dep:wgpu", "dep:bytemuck"]
 telemetry = ["dep:socket2", "dep:serde", "gpu"]
 
 [dependencies]
@@ -23,6 +23,7 @@ ahash             = "0.8"
 profiling         = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Profiling", rev = "12424a5f75166332f9f1d2741281f6fc4847b44d" }
 tracing           = { workspace = true }
 wgpu              = { version = "30", optional = true }
+bytemuck          = { version = "1.25", features = ["derive"], optional = true }
 
 [dev-dependencies]
 rand = "0.8"
@@ -32,6 +33,7 @@ naga = { version = "30", features = ["wgsl-in"] }
 ratatui = "0.29"
 crossterm = "0.28"
 pulsar_scenedb_derive = { path = "../pulsar_scenedb_derive" }
+trybuild = "1.0"
 
 [[example]]
 name = "stress_tui"
@@ -113,6 +115,10 @@ name = "gpu_derive_field_collision"
 required-features = ["gpu"]
 
 [[test]]
+name = "gpu_named_buffer"
+required-features = ["gpu"]
+
+[[test]]
 name = "world_gpu_mirror"
 required-features = ["gpu"]
 
@@ -134,4 +140,8 @@ required-features = ["gpu"]
 
 [[test]]
 name = "world_gpu_mirror_reservation_shrink"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_compile_fail"
 required-features = ["gpu"]
