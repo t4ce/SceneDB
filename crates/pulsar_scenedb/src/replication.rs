@@ -7,18 +7,46 @@
 //! exposing a controlled, observable, and filterable stream of its own
 //! mutations.
 //!
+//! ## Experimental wire-contract warning
+//!
+//! The local tracking, schema, snapshot, filtering, authority, event, and
+//! reconciliation building blocks in this module are usable, but the current
+//! serialized handshake/`Delta` format is **not a supported cross-process
+//! replication protocol**. In particular:
+//!
+//! - [`ComponentId`] values are dense, process-local, first-registration IDs.
+//!   The handshake describes those numeric IDs but does not negotiate them to
+//!   independently registered local component types.
+//! - [`ChangeTracker::drain_with_world`] records structural state but does not
+//!   yet encode every component's final replicated field values.
+//! - An empty inner field payload is still used as the legacy sparse-change
+//!   sentinel even though empty bytes can be a valid [`Replicable`] encoding.
+//! - Adding a component to an already-live remote entity needs an explicit
+//!   wire `Set` operation; the legacy field patch cannot create that column.
+//!
+//! Consequently, do not exchange `handshake_message`, `Delta`, `Snapshot`, or
+//! event component IDs between independently initialized processes. A sound
+//! protocol needs stable schema keys/versions, a negotiated wire-ID-to-local
+//! mapping, and explicit `Set`/`Patch`/`Remove` operations with explicit field
+//! presence. The existing format remains useful for tests and same-process
+//! worlds that share the global component registry. This limitation does not
+//! affect SceneDB's local ECS or CPU/GPU mirror paths.
+//!
 //! ## Design tenets
 //!
 //! 1. **SceneDB owns the data pipeline** — change tracking, delta encoding,
-//!    interest management, authority, and condition filtering. Everything up
-//!    to encoded byte blobs.
+//!    interest management, authority, and condition filtering. The present
+//!    module contains those primitives; the warning above describes the
+//!    missing protocol-binding layer.
 //! 2. **SceneDB does NOT own transport** — networking, encryption, connection
 //!    management, and asset streaming live in the engine. SceneDB produces
-//!    `Delta` frames and `ReplicatedEvent` payloads; the engine ships them.
-//! 3. **SceneDB does NOT own asset payloads** — a `gpu_handle`-mode field
-//!    replicates only the handle index (8 bytes), not the vertex data. The
-//!    asset system (`engine-fs`, streaming, etc.) independently ensures the
-//!    resource exists on the remote peer.
+//!    local `Delta`/`ReplicatedEvent` values; a future negotiated protocol
+//!    layer must bind their identities before an engine transports them.
+//! 3. **SceneDB does NOT own asset payloads** — a `GpuHandle`-mode field is a
+//!    semantic tag for an application-defined stable asset key, not the mesh or
+//!    texture payload. Current helper codecs copy the registered field bytes and
+//!    do not enforce an eight-byte handle layout. The asset system independently
+//!    ensures the resource exists on the remote peer.
 //! 4. **SceneDB does NOT own editor collaboration** — operational transform,
 //!    lock servers, undo history, and CRDTs live in the editor. SceneDB
 //!    provides `Shared` ownership + deterministic frame-batched conflict
@@ -38,9 +66,9 @@
 //!
 //! | Variant | Wire cost | When to use |
 //! |---|---|---|
-//! | `Pod` | `sizeof(T)` bytes, direct memcpy | Simple value types — transforms, stats, enums. Default for anything implementing `Pod`. Schema negotiated once at handshake. |
+//! | `Pod` | `sizeof(T)` bytes, direct memcpy | Simple value types — transforms, stats, enums. Default for anything implementing `Pod`. Both local schemas must agree; the legacy handshake does not negotiate that identity. |
 //! | `Serialized` | Variable | Reflection-based via `EngineClass`. For blueprint/visual-scripting components. |
-//! | `GpuHandle` | `sizeof(Handle)` = 8 B | Mesh references, texture handles, buffer bindings. Only the registry index travels; the GPU resource is loaded independently by the asset system. |
+//! | `GpuHandle` | `sizeof(field)` bytes | Semantic raw-copy encoding for a reviewed stable asset key. Payload residency is handled independently; the helper does not enforce a particular key width. |
 //! | `DeltaCompressed` | Small, variable | Slowly-changing values (health, cooldown, ammo). XOR-diff from the last acknowledged value, then LEB128 encoded — the stateful [`DeltaCompressor`] implements this; the standalone [`encode_field_value`]/[`decode_field_value`] helpers only do the stateless LEB128-of-the-absolute-value half (no cache to diff against). |
 //! | `Event` | 0 in state deltas | One-shot RPC-style delivery. Never appears in frame snapshots or reconciliation state. Delivered on a separate channel. |
 //! | `Opaque` | Custom | Escape hatch. The component provides `encode`/`decode` fn pointers at registration time. |
@@ -101,9 +129,9 @@
 //! `#[replicate(...)]` field attributes — see that macro's doc.
 //!
 //! The registry produces a `ReplicationSchema` — a compact per-component-type
-//! descriptor table that the delta encoder walks at runtime. The schema is
-//! also shared with remote peers during the initial connection handshake so
-//! both sides agree on field layout and encoding.
+//! descriptor table used by local encoders. The legacy handshake can serialize
+//! that table for inspection, but it does not establish stable cross-process
+//! type identity or bind remote schemas to local encode/decode closures.
 //!
 //! ## Authority model
 //!
@@ -117,7 +145,7 @@
 //!   No locks, no operational transform — optimistic apply with frame-level
 //!   rollback.
 //!
-//! ## The delta pipeline
+//! ## Intended delta pipeline
 //!
 //! Every frame, at the **SimulateB→Harvest** phase boundary:
 //!
@@ -133,7 +161,7 @@
 //!      ↓
 //! 3. Emit Delta (state) + EventBatch (RPCs)
 //!      ↓
-//! 4. Engine transports to remote peer
+//! 4. A future negotiated protocol transports to a remote peer
 //! ```
 //!
 //! Step 2a reuses the existing SIMD-accelerated `SpatialCell::query_aabb_in`
@@ -175,10 +203,11 @@
 //! there is no internal locking. The intended shape (matching
 //! `crate::gpu::phase`'s own single-threaded-caller design) is: one thread
 //! owns a `World` + `ChangeTracker` pair for the duration of a frame; the
-//! `Delta` that frame produces is the unit that crosses thread/connection
-//! boundaries, not the mutable state itself.
+//! `Delta` that frame produces may cross a thread boundary, not the mutable
+//! state itself. Crossing a connection additionally requires the negotiated
+//! protocol layer described in the warning above.
 //!
-//! ## Implementation plan
+//! ## Historical implementation outline
 //!
 //! ### R1 — Core types and ChangeTracker
 //!
@@ -189,13 +218,13 @@
 //! - Wire `World` methods to accept `&mut ChangeTracker`.
 //! - Unit tests verifying correct change accumulation across a frame.
 //!
-//! ### R2 — Schema and delta encoding
+//! ### R2 — Local schema and legacy delta encoding
 //!
 //! - Define `ReplicationSchema` and `ReplicationRegistry`.
 //! - Derive macro `#[replicate(...)]` for component fields.
 //! - Implement `Delta` struct + encoding for all built-in
 //!   `ReplicationEncoding` variants (Pod is a direct memcpy, etc.).
-//! - Schema handshake message for connection initialization.
+//! - Legacy schema descriptor message (not stable-ID negotiation).
 //! - Unit tests: round-trip encode/decode for every encoding mode.
 //!
 //! ### R3 — Relevance and conditions
@@ -228,7 +257,7 @@ use crate::component::ComponentId;
 use crate::entity::Entity;
 use crate::snapshot::LivenessSnapshot;
 use crate::spatial::{Aabb, SpatialCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
@@ -261,11 +290,14 @@ pub struct ClientId(pub u64);
 /// How a replicated field's value is encoded on the wire.
 #[derive(Clone, Debug)]
 pub enum ReplicationEncoding {
-    /// Direct memcpy of Pod bytes. Schema negotiated at handshake.
+    /// Direct memcpy of Pod bytes. Local schemas must already agree; the
+    /// legacy handshake does not negotiate stable type identity.
     Pod,
     /// Reflection-based via EngineClass (blueprint components).
     Serialized,
-    /// Only the registry handle/index (8 bytes). Asset payload is out-of-band.
+    /// Semantic raw-copy encoding for an application-defined stable asset key.
+    /// The helper does not enforce a particular byte width; asset payload is
+    /// out-of-band.
     GpuHandle,
     /// XOR-diff from last acknowledged value, LEB128 compressed — the
     /// diffing itself needs a per-connection cache (see [`DeltaCompressor`]);
@@ -596,7 +628,10 @@ pub struct FieldDescriptor {
 }
 
 /// Per-component-type replication schema.
-/// Produced by `ReplicationRegistry` and shared at connection handshake.
+///
+/// Produced by `ReplicationRegistry`. The legacy handshake serializes its
+/// numeric shape but does not bind a remote schema to local Rust operations;
+/// see the module-level experimental wire-contract warning.
 #[derive(Clone, Debug)]
 pub struct ReplicationSchema {
     pub component_type: ComponentId,
@@ -700,8 +735,10 @@ impl<T: crate::Component> SchemaBuilder<T> {
 // ── Registry ───────────────────────────────────────────────────────────────
 
 /// Registry of replication schemas for all component types.
-/// Produces handshake messages for connection initialization and is used by
-/// the delta encoder to dispatch per-field encoding.
+///
+/// It dispatches local per-field encoding. Its current handshake is a schema
+/// description only, not a negotiated cross-process type mapping; see the
+/// module-level experimental wire-contract warning.
 #[derive(Clone, Debug)]
 pub struct ReplicationRegistry {
     schemas: HashMap<ComponentId, ReplicationSchema>,
@@ -753,7 +790,10 @@ impl ReplicationRegistry {
         self.schemas.insert(schema.component_type, schema);
     }
 
-    /// Serialize all registered schemas into a handshake byte buffer.
+    /// Serialize all registered schemas into the legacy handshake byte buffer.
+    ///
+    /// This preserves process-local [`ComponentId`] values and is therefore
+    /// suitable for schema inspection/tests, not cross-process negotiation.
     ///
     /// Wire format (all values little-endian):
     ///   `schema_count: u32`
@@ -783,7 +823,11 @@ impl ReplicationRegistry {
         buf
     }
 
-    /// Deserialize a handshake message produced by a remote peer.
+    /// Deserialize a legacy handshake into a descriptor-only registry.
+    ///
+    /// The result has no local [`FieldOps`] or [`RowOps`] and does not map the
+    /// sender's process-local component IDs to local types. It must not be
+    /// passed to [`Delta::apply`] as if negotiation had occurred.
     pub fn from_handshake(bytes: &[u8]) -> Result<Self, ErrorCode> {
         let mut ofs = 0;
         if ofs + 4 > bytes.len() {
@@ -979,12 +1023,12 @@ pub fn encode_field_value(encoding: &ReplicationEncoding, value_bytes: &[u8], bu
     }
 }
 
-/// Encode a Pod field directly into a byte slice — the zero-copy
+/// Copy a Pod field directly into a caller-provided byte slice — the
 /// counterpart to [`encode_field_value`]'s `Pod`/`Serialized`/`GpuHandle`
 /// branch, which allocates into (and may reallocate/grow) a `Vec<u8>`. For
-/// hot paths that already own a destination buffer — e.g. assembling a
-/// network packet, or [`ChangeTracker`]'s per-field scratch — this memcpy's
-/// straight in with no intermediate allocation.
+/// hot paths that already own a destination buffer—e.g. assembling a packet
+/// or [`ChangeTracker`]'s per-field scratch—this performs one memcpy with no
+/// intermediate allocation. It is allocation-free, not zero-copy.
 ///
 /// Returns the number of bytes written (always `value_bytes.len()`).
 ///
@@ -1178,7 +1222,8 @@ impl Default for DeltaCompressor {
 /// `count: u32` then `count` × `component_id: u32`, little-endian). Used to
 /// fill [`Delta::spawned`]'s per-entity blob (see
 /// [`ChangeTracker::drain_with_world`]) so [`Delta::apply`] can reconstruct
-/// the spawning entity's exact archetype on a remote peer.
+/// the spawning entity's archetype in another World sharing the same global
+/// component registry. These raw IDs are not cross-process identities.
 pub fn encode_archetype_key(ids: &[ComponentId]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + ids.len() * 4);
     buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
@@ -1392,6 +1437,15 @@ impl Delta {
 
     /// Apply this Delta's changes to a World.
     ///
+    /// # Legacy wire contract
+    ///
+    /// This API assumes the producer and consumer share SceneDB's process-local
+    /// component registry and that the caller supplied complete, unambiguous
+    /// field payloads. It is not safe as a cross-process protocol; see the
+    /// module-level warning. In particular, an empty inner field payload is
+    /// still treated as "not present", and a field patch cannot structurally
+    /// add a missing component.
+    ///
     /// 1. Despawns removed entities.
     /// 2. Spawns new entities at their EXACT wire `Entity` (index +
     ///    generation) into the archetype encoded in each spawn's blob —
@@ -1444,6 +1498,11 @@ impl Delta {
         schema: &ReplicationRegistry,
         _scratch: &mut Vec<u8>,
     ) -> Result<(), ErrorCode> {
+        // Preserve wire order for deterministic component-local GPU-row
+        // allocation while using a set only to suppress duplicates.
+        let mut gpu_publish = Vec::new();
+        let mut gpu_publish_seen = HashSet::new();
+
         for &entity in &self.despawned {
             world.despawn(entity);
         }
@@ -1451,11 +1510,17 @@ impl Delta {
         for (entity, blob) in &self.spawned {
             let cids = decode_archetype_key(blob).unwrap_or_default();
             let key = ArchetypeKey::new(cids);
+            let publish_cids = key.0.clone();
             if world
                 .force_spawn_in_archetype(*entity, key, |cid| schema.row_ops(cid).copied())
                 .is_none()
             {
                 return Err(ErrorCode::InvalidData);
+            }
+            for cid in publish_cids {
+                if gpu_publish_seen.insert((*entity, cid)) {
+                    gpu_publish.push((*entity, cid));
+                }
             }
         }
 
@@ -1463,6 +1528,16 @@ impl Delta {
             let Some(s) = schema.schema(cd.component_type) else {
                 continue;
             };
+
+            // An outer field list with zero entries is the explicit
+            // structural-removal operation. It is structurally distinct from
+            // an inner entry, but the legacy patch loop below still treats an
+            // empty inner payload as "field absent". Empty encoded values need
+            // the future explicit FieldDelta representation described above.
+            if cd.field_data.is_empty() {
+                world.remove_component_erased(cd.entity, cd.component_type);
+                continue;
+            }
             for field in &s.fields {
                 if matches!(field.encoding, ReplicationEncoding::Event) {
                     continue;
@@ -1479,13 +1554,28 @@ impl Delta {
                 }
                 world.write_component_field(cd.entity, cd.component_type, &*ops.decode_into, bytes)?;
             }
+            if gpu_publish_seen.insert((cd.entity, cd.component_type)) {
+                gpu_publish.push((cd.entity, cd.component_type));
+            }
+        }
+
+        // Type-erased field decoding intentionally bypasses `World::insert`.
+        // Publish only after every field has reached its final CPU value so a
+        // new Once component hands off real replicated bytes, never the
+        // placeholder `Default` row used during structural reconstruction.
+        for (entity, cid) in gpu_publish {
+            world.publish_component_to_gpu(entity, cid);
         }
 
         Ok(())
     }
 }
 
-/// Sparse component data for one entity within a Delta.
+/// Sparse component data for one entity within a legacy Delta.
+///
+/// An empty outer `field_data` means component removal. Empty inner payloads
+/// cannot currently be represented as values because the legacy patch format
+/// also uses them as its sparse "unchanged field" sentinel.
 #[derive(Clone, Debug)]
 pub struct ComponentDelta {
     pub entity: Entity,
@@ -1500,7 +1590,10 @@ pub struct ComponentDelta {
 #[derive(Clone, Debug)]
 pub struct ChangeTracker {
     spawned: Vec<Entity>,
+    spawned_set: HashSet<Entity>,
+    cancelled_spawned: HashSet<Entity>,
     despawned: Vec<Entity>,
+    despawned_set: HashSet<Entity>,
     component_changes: Vec<ComponentDelta>,
     events: Vec<ReplicatedEvent>,
     frame: u64,
@@ -1510,7 +1603,10 @@ impl ChangeTracker {
     pub fn new() -> Self {
         Self {
             spawned: Vec::new(),
+            spawned_set: HashSet::new(),
+            cancelled_spawned: HashSet::new(),
             despawned: Vec::new(),
+            despawned_set: HashSet::new(),
             component_changes: Vec::new(),
             events: Vec::new(),
             frame: 0,
@@ -1518,11 +1614,27 @@ impl ChangeTracker {
     }
 
     pub fn record_spawn(&mut self, entity: Entity) {
-        self.spawned.push(entity);
+        if self.spawned_set.insert(entity) {
+            self.spawned.push(entity);
+        } else {
+            self.cancelled_spawned.remove(&entity);
+        }
     }
 
     pub fn record_despawn(&mut self, entity: Entity) {
-        self.despawned.push(entity);
+        // A lifetime created and destroyed inside one harvest window never
+        // existed from the remote peer's point of view. Emitting both events
+        // is not merely redundant: Delta::apply processes despawns before
+        // spawns, which would incorrectly resurrect the entity. Collapse the
+        // transient lifetime and every state/event record attached to it.
+        if self.spawned_set.contains(&entity) {
+            self.cancelled_spawned.insert(entity);
+            return;
+        }
+
+        if self.despawned_set.insert(entity) {
+            self.despawned.push(entity);
+        }
     }
 
     pub fn record_component_change(
@@ -1559,6 +1671,32 @@ impl ChangeTracker {
         }
     }
 
+    /// Record removal of one component while leaving its entity alive.
+    ///
+    /// A removal is represented by a [`ComponentDelta`] whose *outer*
+    /// `field_data` vector is empty. This is distinct from an inner entry at
+    /// the container level, but the legacy apply path still cannot distinguish
+    /// an empty encoded field value from its sparse "unchanged" sentinel.
+    pub fn record_component_removal(
+        &mut self,
+        entity: Entity,
+        component_type: ComponentId,
+    ) {
+        if let Some(existing) = self
+            .component_changes
+            .iter_mut()
+            .find(|cd| cd.entity == entity && cd.component_type == component_type)
+        {
+            existing.field_data.clear();
+        } else {
+            self.component_changes.push(ComponentDelta {
+                entity,
+                component_type,
+                field_data: Vec::new(),
+            });
+        }
+    }
+
     pub fn record_event(&mut self, event: ReplicatedEvent) {
         self.events.push(event);
     }
@@ -1569,16 +1707,17 @@ impl ChangeTracker {
         _client: ClientId,
         _authority: &AuthorityTable,
     ) -> (Delta, Vec<ReplicatedEvent>) {
+        let (spawned, despawned, component_deltas, events) = self.take_frame_changes();
         let delta = Delta {
             frame: self.frame,
             base_frame: self.frame.wrapping_sub(1),
-            spawned: mem::take(&mut self.spawned)
+            spawned: spawned
                 .into_iter()
                 .map(|e| (e, self.frame.to_le_bytes().to_vec()))
                 .collect(),
-            despawned: mem::take(&mut self.despawned),
-            component_deltas: mem::take(&mut self.component_changes),
-            events: mem::take(&mut self.events),
+            despawned,
+            component_deltas,
+            events,
         };
         (delta, Vec::new())
     }
@@ -1587,14 +1726,44 @@ impl ChangeTracker {
         self.frame = self.frame.wrapping_add(1);
     }
 
+    /// Drain and coalesce structural state in O(number of recorded changes).
+    fn take_frame_changes(
+        &mut self,
+    ) -> (
+        Vec<Entity>,
+        Vec<Entity>,
+        Vec<ComponentDelta>,
+        Vec<ReplicatedEvent>,
+    ) {
+        let cancelled = mem::take(&mut self.cancelled_spawned);
+        let terminal = mem::take(&mut self.despawned_set);
+        self.spawned_set.clear();
+
+        let mut spawned = mem::take(&mut self.spawned);
+        spawned.retain(|entity| !cancelled.contains(entity));
+
+        let despawned = mem::take(&mut self.despawned);
+        let mut component_deltas = mem::take(&mut self.component_changes);
+        component_deltas.retain(|change| {
+            !cancelled.contains(&change.entity) && !terminal.contains(&change.entity)
+        });
+        let mut events = mem::take(&mut self.events);
+        events.retain(|event| !cancelled.contains(&event.entity));
+
+        (spawned, despawned, component_deltas, events)
+    }
+
     /// Like [`drain`](Self::drain) but encodes each spawned entity's
     /// *current* archetype (looked up in `world`) as its blob via
-    /// [`encode_archetype_key`], so the resulting [`Delta`] can be fully
-    /// reconstructed on a remote peer by [`Delta::apply`]. Plain `drain`
-    /// cannot do this — it has no `World` access, so its blob is just a
-    /// placeholder frame marker.
+    /// [`encode_archetype_key`], so the resulting [`Delta`] has real structural
+    /// spawn information for another World sharing the same component
+    /// registry. It does **not** encode all final replicated field values and
+    /// is not independently reconstructible across processes. Plain `drain`
+    /// has no `World` access, so even its spawn blob is only a placeholder
+    /// frame marker.
     pub fn drain_with_world(&mut self, world: &crate::World) -> Delta {
-        let spawned = mem::take(&mut self.spawned)
+        let (spawned, despawned, component_deltas, events) = self.take_frame_changes();
+        let spawned = spawned
             .into_iter()
             .map(|e| {
                 let blob = if world.is_alive(e) {
@@ -1610,9 +1779,9 @@ impl ChangeTracker {
             frame: self.frame,
             base_frame: self.frame.wrapping_sub(1),
             spawned,
-            despawned: mem::take(&mut self.despawned),
-            component_deltas: mem::take(&mut self.component_changes),
-            events: mem::take(&mut self.events),
+            despawned,
+            component_deltas,
+            events,
         }
     }
 }
@@ -1705,8 +1874,9 @@ impl RelevanceSet {
     ///
     /// For each spatial cell with visible rows, calls `resolve(cell_idx, row_token)`
     /// which should return `Some(entity)` for rows that map to an ECS entity.
-    /// Uses `SpatialCell::query_frustum_in` internally — zero alloc after warm-up
-    /// when using `Scratchpad` + `LivenessSnapshot`.
+    /// `SpatialCell::query_frustum_in` reuses `Scratchpad` storage, but the
+    /// returned `RelevanceSet` owns a fresh `Vec` and may allocate while results
+    /// are appended.
     pub fn from_frustum(
         cells: &[SpatialCell],
         frustum: &crate::spatial::Frustum,
@@ -1900,7 +2070,7 @@ pub fn can_send_event(direction: &ReplicationCondition, sender: ClientId, recipi
         ReplicationCondition::ClientToServer => true,
         ReplicationCondition::ServerToClient => sender == recipient,
         ReplicationCondition::Multicast => sender != recipient,
-        other => {
+        _other => {
             // Other conditions don't make sense for events — treat as always
             // sendable (the state path handles them).
             true
@@ -2215,9 +2385,6 @@ impl Snapshot {
                     let Some(bytes) = field_data.get(idx) else {
                         continue;
                     };
-                    if bytes.is_empty() {
-                        continue;
-                    }
                     world.write_component_field(entity_snap.entity, *cid, &*ops.decode_into, bytes)?;
                 }
             }
@@ -2253,9 +2420,10 @@ impl Snapshot {
                         }
                         let Some(ops) = &field.ops else { continue };
                         let mut buf = Vec::new();
-                        if (ops.encode)(col, row, &mut buf).is_ok() {
-                            field_data[idx] = buf;
-                        }
+                        (ops.encode)(col, row, &mut buf).expect(
+                            "registered snapshot field encoder must match its component column",
+                        );
+                        field_data[idx] = buf;
                     }
                 }
             }
@@ -2749,6 +2917,36 @@ mod tests {
     }
 
     #[test]
+    fn spawn_then_despawn_in_one_frame_collapses_the_transient_lifetime() {
+        let mut world = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+        let entity = world.spawn_tracked(&mut tracker);
+        world.insert_tracked(entity, 5u32, &mut tracker);
+        tracker.record_event(ReplicatedEvent {
+            entity,
+            component_type: crate::component::component_id::<u32>(),
+            event_field: 0,
+            payload: vec![1],
+            channel: EventChannel::ReliableOrdered,
+            target_client: None,
+        });
+        assert!(world.despawn_tracked(entity, &mut tracker));
+
+        let delta = tracker.drain_with_world(&world);
+        assert!(delta.spawned.is_empty());
+        assert!(delta.despawned.is_empty());
+        assert!(delta.component_deltas.is_empty());
+        assert!(delta.events.is_empty());
+
+        let mut remote = crate::World::new();
+        assert_eq!(
+            delta.apply(&mut remote, &ReplicationRegistry::new()),
+            Ok(())
+        );
+        assert!(!remote.is_alive(entity));
+    }
+
+    #[test]
     fn tracker_records_component_changes() {
         let mut t = ChangeTracker::new();
         let e = make_entity(0, 1);
@@ -2859,6 +3057,53 @@ mod tests {
     }
 
     #[test]
+    fn world_insert_tracked_never_reads_arbitrary_component_representation() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct NonPodComponent {
+            label: String,
+            discriminator: u8,
+        }
+
+        let mut world = crate::World::new();
+        let mut tracker = ChangeTracker::new();
+        let entity = world.spawn();
+        world.insert(
+            entity,
+            NonPodComponent {
+                label: "old".to_owned(),
+                discriminator: 1,
+            },
+        );
+        world.insert_tracked(
+            entity,
+            NonPodComponent {
+                label: "new".to_owned(),
+                discriminator: 2,
+            },
+            &mut tracker,
+        );
+
+        let cid = crate::component::component_id::<NonPodComponent>();
+        let (delta, _) = tracker.drain(
+            &test_schema(cid),
+            ClientId(0),
+            &AuthorityTable::new(),
+        );
+        assert_eq!(
+            world.get::<NonPodComponent>(entity),
+            Some(&NonPodComponent {
+                label: "new".to_owned(),
+                discriminator: 2,
+            })
+        );
+        assert_eq!(delta.component_deltas.len(), 1);
+        assert!(
+            delta.component_deltas[0].field_data[0].is_empty(),
+            "generic tracked writes carry a dirty marker, never raw T bytes"
+        );
+    }
+
+    #[test]
     fn world_remove_tracked_records_change() {
         let mut world = crate::World::new();
         let mut tracker = ChangeTracker::new();
@@ -2869,6 +3114,49 @@ mod tests {
         let (delta, _) = tracker.drain(&test_schema(crate::component::component_id::<f32>()), ClientId(0), &AuthorityTable::new());
         assert_eq!(delta.component_deltas.len(), 1);
         assert_eq!(delta.component_deltas[0].entity, e);
+        assert!(
+            delta.component_deltas[0].field_data.is_empty(),
+            "component removal is an explicit zero-field structural delta"
+        );
+    }
+
+    #[test]
+    fn component_removal_round_trips_and_preserves_other_components() {
+        let mut registry = ReplicationRegistry::new();
+        let f32_schema = registry.register::<f32>().whole_field(
+            "value",
+            ReplicationEncoding::Pod,
+            ReplicationCondition::Always,
+        );
+        registry.insert(f32_schema);
+
+        let mut world = crate::World::new();
+        let entity = world.spawn();
+        world.insert(entity, 42.0f32);
+        world.insert(entity, String::from("survivor"));
+
+        let removal = Delta {
+            frame: 1,
+            base_frame: 0,
+            spawned: Vec::new(),
+            despawned: Vec::new(),
+            component_deltas: vec![ComponentDelta {
+                entity,
+                component_type: crate::component::component_id::<f32>(),
+                field_data: Vec::new(),
+            }],
+            events: Vec::new(),
+        };
+        let wire = Delta::from_bytes(&removal.to_bytes()).expect("valid removal delta");
+
+        assert_eq!(wire.apply(&mut world, &registry), Ok(()));
+        assert!(world.is_alive(entity));
+        assert_eq!(world.get::<f32>(entity), None);
+        assert_eq!(world.get::<String>(entity).map(String::as_str), Some("survivor"));
+
+        // Late/repeated delivery is harmless once the component is absent.
+        assert_eq!(wire.apply(&mut world, &registry), Ok(()));
+        assert_eq!(world.get::<String>(entity).map(String::as_str), Some("survivor"));
     }
 
     // ── R2: Schema builder and registry ─────────────────────────────────
@@ -3776,6 +4064,52 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restore_decodes_a_legitimately_empty_field_payload() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct EmptyText(String);
+
+        impl Default for EmptyText {
+            fn default() -> Self {
+                Self("placeholder".to_owned())
+            }
+        }
+
+        impl Replicable for EmptyText {
+            fn replicate_default() -> Self {
+                Self::default()
+            }
+
+            fn replicate_encode(&self, buf: &mut Vec<u8>) {
+                buf.extend_from_slice(self.0.as_bytes());
+            }
+
+            fn replicate_decode(bytes: &[u8]) -> Result<Self, ErrorCode> {
+                String::from_utf8(bytes.to_vec())
+                    .map(Self)
+                    .map_err(|_| ErrorCode::InvalidData)
+            }
+        }
+
+        let mut registry = ReplicationRegistry::new();
+        let schema = registry.register::<EmptyText>().whole_field(
+            "text",
+            ReplicationEncoding::Serialized,
+            ReplicationCondition::Always,
+        );
+        registry.insert(schema);
+
+        let mut source = crate::World::new();
+        let entity = source.spawn();
+        source.insert(entity, EmptyText(String::new()));
+        let snapshot = Snapshot::capture_full(&source, &registry, 1);
+        assert!(snapshot.entities[0].components[0].1[0].is_empty());
+
+        let mut target = crate::World::new();
+        assert_eq!(snapshot.restore_to_world(&mut target, &registry), Ok(()));
+        assert_eq!(target.get::<EmptyText>(entity), Some(&EmptyText(String::new())));
+    }
+
+    #[test]
     fn snapshot_restore_to_world_with_unregistered_component_fails_cleanly() {
         let mut source = crate::World::new();
         let e = source.spawn();
@@ -4318,6 +4652,42 @@ mod tests {
             events: vec![],
         };
         assert_eq!(delta.apply(&mut world, &reg), Err(ErrorCode::InvalidData));
+    }
+
+    #[test]
+    fn failed_replicated_spawn_does_not_evict_or_partially_migrate() {
+        let mut world = crate::World::new();
+        let incumbent = world.spawn();
+        world.insert(incumbent, 17.0f32);
+
+        let mut reg = ReplicationRegistry::new();
+        let f32_builder = reg.register::<f32>().whole_field(
+            "value",
+            ReplicationEncoding::Pod,
+            ReplicationCondition::Always,
+        );
+        reg.insert(f32_builder);
+
+        let incoming = make_entity(incumbent.index(), incumbent.generation() + 1);
+        let unknown = ComponentId(999_999);
+        let blob = encode_archetype_key(&[
+            crate::component::component_id::<f32>(),
+            unknown,
+        ]);
+        let delta = Delta {
+            frame: 1,
+            base_frame: 0,
+            spawned: vec![(incoming, blob)],
+            despawned: Vec::new(),
+            component_deltas: Vec::new(),
+            events: Vec::new(),
+        };
+
+        assert_eq!(delta.apply(&mut world, &reg), Err(ErrorCode::InvalidData));
+        assert!(world.is_alive(incumbent));
+        assert!(!world.is_alive(incoming));
+        assert_eq!(world.get::<f32>(incumbent), Some(&17.0));
+        assert_eq!(world.query::<&f32>().count(), 1);
     }
 
     #[test]

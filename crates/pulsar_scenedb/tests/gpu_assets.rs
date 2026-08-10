@@ -6,7 +6,20 @@
 //! `tests/common/mod.rs`, and that refactor is deliberately out of scope here.
 
 use pulsar_scenedb::gpu::{ArenaError, ClusterBuffer, ClusterError, ClusterNode, EngineGpuContext, GeometryArena, MaterialError, MaterialRegistry, MaterialRow, MeshError, MeshMetadata, MeshRegistry, MeshletBuffer, MeshletEntry, MeshletError, TextureError, TextureStore};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+struct SharedTestGpu {
+    // Keep the backend ownership chain alive until the integration-test
+    // process exits. `gpu_assets` runs dozens of tests in parallel; creating
+    // one Vulkan device per test can exhaust driver device memory before the
+    // first wave has torn down.
+    _instance: wgpu::Instance,
+    _adapter: wgpu::Adapter,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+}
+
+static TEST_GPU: OnceLock<SharedTestGpu> = OnceLock::new();
 
 /// Byte view of `MeshMetadata` entries for readback comparison. Mirrors the
 /// crate-internal `gpu::as_bytes` (pub(crate) — not visible to this
@@ -55,27 +68,35 @@ fn vg_mesh() -> MeshMetadata {
 }
 
 fn test_context() -> EngineGpuContext {
-    // Upstream wgpu 30: `Instance::new` still takes an owned
-    // `InstanceDescriptor`, but the type no longer derives `Default` — use
-    // the `new_without_display_handle()` constructor (headless, no window
-    // system connection), equivalent to the fork's bare `default()`.
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        // Upstream wgpu 30 added this field (limit-bucketing/anti-fingerprint
-        // knob); `false` preserves the fork's behavior of exposing the
-        // adapter's real limits, unbucketed.
-        apply_limit_buckets: false,
-    }))
-    .expect("no adapter — GPU tests need a local GPU");
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("scenedb-m2a-test"),
-        ..Default::default()
-    }))
-    .expect("device");
-    EngineGpuContext::new(Arc::new(device), Arc::new(queue))
+    let shared = TEST_GPU.get_or_init(|| {
+        // Upstream wgpu 30: `Instance::new` still takes an owned
+        // `InstanceDescriptor`, but the type no longer derives `Default` — use
+        // the headless constructor so the test needs no window-system handle.
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            },
+        ))
+        .expect("no adapter — GPU tests need a local GPU");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("scenedb-gpu-assets-shared-test-device"),
+                ..Default::default()
+            }))
+            .expect("device");
+        SharedTestGpu {
+            _instance: instance,
+            _adapter: adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+        }
+    });
+    EngineGpuContext::new(Arc::clone(&shared.device), Arc::clone(&shared.queue))
 }
 
 fn readback(ctx: &EngineGpuContext, buf: &wgpu::Buffer, bytes: u64) -> Vec<u8> {

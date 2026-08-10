@@ -297,7 +297,12 @@ impl World {
     fn spawn_inner(&mut self, tracker: Option<&mut ChangeTracker>) -> Entity {
         let (idx, gen) = if let Some(idx) = self.free_slots.pop() {
             let slot = &mut self.entity_slots[idx as usize];
-            slot.generation = slot.generation.wrapping_add(1);
+            debug_assert_eq!(slot.row, crate::entity::DEAD_ROW);
+            debug_assert_ne!(
+                slot.generation,
+                u32::MAX,
+                "permanently retired entity slot entered the free list"
+            );
             slot.archetype = ArchetypeId::EMPTY;
             (idx, slot.generation)
         } else {
@@ -391,10 +396,17 @@ impl World {
             self.entity_slots[moved.index() as usize].row = row as u32;
         }
         let slot = &mut self.entity_slots[entity.index() as usize];
-        slot.generation = slot.generation.wrapping_add(1);
+        // u32::MAX is a permanent tombstone: normal allocation never issues
+        // it as a live generation, so an ancient Entity can never become
+        // valid again after counter exhaustion.
+        slot.generation = slot.generation.saturating_add(1);
+        slot.archetype = ArchetypeId::EMPTY;
+        slot.row = crate::entity::DEAD_ROW;
         #[cfg(feature = "gpu")]
         let new_generation = slot.generation;
-        self.free_slots.push(entity.index());
+        if slot.generation != u32::MAX {
+            self.free_slots.push(entity.index());
+        }
 
         // GPU liveness mirror: queue the FRESHLY-BUMPED generation, not
         // `entity`'s own (now-dead) one -- a reader still holding `entity`
@@ -432,7 +444,9 @@ impl World {
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entity_slots
             .get(entity.index() as usize)
-            .map(|s| s.generation == entity.generation())
+            .map(|s| {
+                s.row != crate::entity::DEAD_ROW && s.generation == entity.generation()
+            })
             .unwrap_or(false)
     }
 
@@ -599,11 +613,16 @@ impl World {
         // In-place update: entity already has this component in this archetype.
         if !is_new_insert {
             if let Some(t) = tracker.as_deref_mut() {
-                // Capture bytes before the value is moved into the column.
-                let len = std::mem::size_of::<T>();
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, len) };
-                t.record_component_change(entity, cid, 0, bytes.to_vec());
+                // `Component` deliberately permits non-Pod values and
+                // ordinary Rust structs with padding. Reading the whole `T`
+                // as bytes here would therefore observe uninitialised padding
+                // (UB) and would not represent a multi-field replication
+                // schema correctly anyway. Record the structural dirty event
+                // only, just like the archetype-migration path below. Actual
+                // field payloads must be produced through the registry's
+                // per-field `Replicable` encoders (or recorded explicitly by
+                // the caller) rather than guessed from `T`'s memory layout.
+                t.record_component_change(entity, cid, 0, Vec::new());
             }
             let col = self.archetypes[old_arch_id.0 as usize].column_mut::<T>();
             col.data[old_row] = value;
@@ -689,28 +708,7 @@ impl World {
             return None;
         }
 
-        // Component removal does not change the entity generation, so it
-        // needs its own explicit GPU presence tombstone. The value row is
-        // also zeroed as hygiene through the type's generated clear callback.
-        #[cfg(feature = "gpu")]
-        if let Some(mirror) = &self.gpu_mirror {
-            if let (Some(clear), Some(gpu_row)) = (
-                crate::gpu::world_mirror::clear_for(cid),
-                mirror.gpu_row_for_component(cid, entity),
-            ) {
-                let transitioned = mirror.store().mark_component_absent(cid, gpu_row);
-                assert!(
-                    transitioned.is_some(),
-                    "GPU-bearing component {cid:?} was used through World without its \
-                     component-presence buffer; register it with \
-                     register_gpu_columns_growable (fixed register_gpu_columns is the \
-                     CellStorage path and cannot provide generic removal safety)"
-                );
-                clear(mirror, gpu_row);
-                let released = mirror.release_gpu_row(cid, entity);
-                debug_assert_eq!(released, Some(gpu_row));
-            }
-        }
+        self.retire_gpu_component(entity, cid);
 
         // Pull the value out of the column.
         let removed_ptr = unsafe {
@@ -731,10 +729,81 @@ impl World {
         self.migrate_row_skip(entity, old_arch_id, old_row, new_arch_id, cid);
 
         if let Some(t) = tracker {
-            t.record_component_change(entity, cid, 0, Vec::new());
+            t.record_component_removal(entity, cid);
         }
 
         Some(removed_val)
+    }
+
+    /// Remove a component identified only by its runtime id.
+    ///
+    /// Replication needs this structural operation for an explicit
+    /// component-removal delta. The erased column itself owns the concrete
+    /// destructor, so non-Pod components are dropped normally and no value
+    /// bytes are reinterpreted here.
+    pub(crate) fn remove_component_erased(
+        &mut self,
+        entity: Entity,
+        cid: ComponentId,
+    ) -> bool {
+        if !self.is_alive(entity) {
+            return false;
+        }
+        let (old_arch_id, old_row) = {
+            let slot = &self.entity_slots[entity.index() as usize];
+            (slot.archetype, slot.row as usize)
+        };
+        if !Self::has_column_id(&self.archetypes[old_arch_id.0 as usize], cid) {
+            return false;
+        }
+
+        self.retire_gpu_component(entity, cid);
+
+        let removed_ptr = unsafe {
+            Self::get_erased_mut(&mut self.archetypes[old_arch_id.0 as usize], cid)
+                .expect("component presence was checked above")
+                .swap_remove_erased(old_row)
+        };
+        unsafe {
+            Self::get_erased(&self.archetypes[old_arch_id.0 as usize], cid)
+                .expect("component column remains registered on its archetype")
+                .drop_erased(removed_ptr);
+        }
+
+        let new_key = self.archetypes[old_arch_id.0 as usize]
+            .key
+            .without_id(cid);
+        let new_arch_id = self.get_or_create_archetype(new_key);
+        self.migrate_row_skip(entity, old_arch_id, old_row, new_arch_id, cid);
+        true
+    }
+
+    /// Publish a component-presence tombstone and release its stable local
+    /// GPU row before the authoritative CPU component is removed.
+    #[inline]
+    fn retire_gpu_component(&self, entity: Entity, cid: ComponentId) {
+        #[cfg(not(feature = "gpu"))]
+        let _ = (entity, cid);
+
+        #[cfg(feature = "gpu")]
+        if let Some(mirror) = &self.gpu_mirror {
+            if let (Some(clear), Some(gpu_row)) = (
+                crate::gpu::world_mirror::clear_for(cid),
+                mirror.gpu_row_for_component(cid, entity),
+            ) {
+                let transitioned = mirror.store().mark_component_absent(cid, gpu_row);
+                assert!(
+                    transitioned.is_some(),
+                    "GPU-bearing component {cid:?} was used through World without its \
+                     component-presence buffer; register it with \
+                     register_gpu_columns_growable (fixed register_gpu_columns is the \
+                     CellStorage path and cannot provide generic removal safety)"
+                );
+                clear(mirror, gpu_row);
+                let released = mirror.release_gpu_row(cid, entity);
+                debug_assert_eq!(released, Some(gpu_row));
+            }
+        }
     }
 
     /// Returns a shared reference to component `T` on `entity`, if present.
@@ -773,6 +842,58 @@ impl World {
         let result = edit(&mut value);
         self.insert(entity, value);
         Some(result)
+    }
+
+    /// Copy-edit-replace every selected component `T` without allocating an
+    /// intermediate entity list.
+    ///
+    /// `edit` receives a copy of each authoritative value and returns whether
+    /// that copy should be committed. Committed values go through the normal
+    /// [`Self::insert`] path, so derive-generated GPU mirror dispatch observes
+    /// the old/new pair and publishes only changed partner fields. Returning
+    /// `false` discards the copy without touching either CPU or GPU state.
+    ///
+    /// The current authoritative row is not modified until the callback
+    /// returns, preserving [`Self::edit`]'s transactional panic behavior. The
+    /// callback cannot structurally mutate the World, so each archetype's row
+    /// order remains stable for the duration of this allocation-free walk.
+    ///
+    /// `#[gpu(mirror = Once)]` fields retain their one-time-handoff semantics
+    /// on replacement. Callers must remove and reinsert a Once component to
+    /// begin a new presence lifetime.
+    pub fn edit_each<T: Component + Copy>(
+        &mut self,
+        mut edit: impl FnMut(Entity, &mut T) -> bool,
+    ) -> usize {
+        let cid = crate::component::component_id::<T>();
+        let mut committed = 0usize;
+
+        for archetype_index in 0..self.archetypes.len() {
+            let row_count = {
+                let archetype = &self.archetypes[archetype_index];
+                if Self::get_erased(archetype, cid).is_none() {
+                    continue;
+                }
+                archetype.entities.len()
+            };
+
+            for row in 0..row_count {
+                // Extract the stable identity in its own borrow window. A
+                // same-component insert replaces in place and therefore cannot
+                // migrate this archetype or invalidate subsequent rows.
+                let entity = self.archetypes[archetype_index].entities[row];
+                let mut value = *self
+                    .get::<T>(entity)
+                    .expect("matching archetype row lost its component during edit_each");
+                if !edit(entity, &mut value) {
+                    continue;
+                }
+                self.insert(entity, value);
+                committed += 1;
+            }
+        }
+
+        committed
     }
 
     /// Returns a mutable reference to CPU-only component `T` on `entity`, if
@@ -848,6 +969,14 @@ impl World {
         let idx = entity.index();
         let gen = entity.generation();
 
+        // `u32::MAX` is the permanent-retirement generation. Accepting it as
+        // a live wire entity would leave no distinct generation to publish
+        // on despawn, defeating both CPU stale-handle rejection and the GPU
+        // generation mirror.
+        if gen == u32::MAX {
+            return None;
+        }
+
         // `idx` is wire-supplied (`Entity::index()` off a replicated,
         // attacker-controlled `Delta::spawned` entry) and the loop below
         // must grow `entity_slots`/`free_slots` to at least `idx + 1` to
@@ -874,15 +1003,39 @@ impl World {
             return None;
         }
 
+        // Resolve every type-erased constructor before mutating slots,
+        // archetypes, or an existing occupant. Previously, an archetype whose
+        // columns already existed could reach the post-push `row_ops(cid)?`
+        // loop and return `None` after its entity vector/slot had already been
+        // changed, leaving parallel column lengths inconsistent.
+        let row_ops_by_component: Vec<_> = key
+            .0
+            .iter()
+            .copied()
+            .map(|cid| row_ops(cid).map(|ops| (cid, ops)))
+            .collect::<Option<_>>()?;
+
+        if let Some(slot) = self.entity_slots.get(idx as usize) {
+            if gen < slot.generation || slot.generation == u32::MAX {
+                // Never move a slot's generation backwards: doing so could
+                // make an already-issued stale Entity live again. A MAX slot
+                // is permanently retired even if an untrusted wire delta
+                // targets it.
+                return None;
+            }
+        }
+
         while (self.entity_slots.len() as u32) <= idx {
             let new_idx = self.entity_slots.len() as u32;
             self.entity_slots.push(EntitySlot::empty(0));
             self.free_slots.push(new_idx);
         }
-        if !self.free_slots.contains(&idx) {
+
+        let slot = &self.entity_slots[idx as usize];
+        if slot.row != crate::entity::DEAD_ROW {
             // `idx` is currently live under some other occupant — the
             // incoming delta is authoritative.
-            let old_gen = self.entity_slots[idx as usize].generation;
+            let old_gen = slot.generation;
             self.despawn(Entity::new(idx, old_gen));
         }
         self.free_slots.retain(|&s| s != idx);
@@ -893,9 +1046,8 @@ impl World {
         };
 
         let arch_id = self.get_or_create_archetype(key.clone());
-        for &cid in &key.0 {
+        for &(cid, ops) in &row_ops_by_component {
             if !Self::has_column_id(&self.archetypes[arch_id.0 as usize], cid) {
-                let ops = row_ops(cid)?;
                 let col = (ops.new_column)();
                 Self::set_column(&mut self.archetypes[arch_id.0 as usize], cid, col);
             }
@@ -906,10 +1058,7 @@ impl World {
         self.entity_slots[idx as usize].archetype = arch_id;
         self.entity_slots[idx as usize].row = row;
 
-        let n = self.archetypes[arch_id.0 as usize].active_cids.len();
-        for i in 0..n {
-            let cid = self.archetypes[arch_id.0 as usize].active_cids[i];
-            let ops = row_ops(cid)?;
+        for &(cid, ops) in &row_ops_by_component {
             let col = Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).unwrap();
             (ops.push_default)(col.as_mut());
         }
@@ -947,6 +1096,61 @@ impl World {
             return Ok(());
         };
         decode_into(col.as_mut(), row, bytes)
+    }
+
+    /// Publish the current authoritative value of one type-erased component
+    /// through the World GPU mirror, if that component has generated partner
+    /// dispatch and a mirror is attached.
+    ///
+    /// Replication reconstructs components through per-field erased decoders,
+    /// not `World::insert<T>`, so it calls this once after all fields for a
+    /// delta have been applied. Supplying no old value deliberately uploads
+    /// every DirtyTracked partner field; Once fields upload only when the
+    /// component-presence transition is new.
+    pub(crate) fn publish_component_to_gpu(&self, entity: Entity, cid: ComponentId) {
+        #[cfg(not(feature = "gpu"))]
+        let _ = (entity, cid);
+
+        #[cfg(feature = "gpu")]
+        {
+            if !self.is_alive(entity) {
+                return;
+            }
+            let Some(mirror) = &self.gpu_mirror else {
+                return;
+            };
+            let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) else {
+                return;
+            };
+            let slot = &self.entity_slots[entity.index() as usize];
+            let Some(column) = Self::get_erased(
+                &self.archetypes[slot.archetype.0 as usize],
+                cid,
+            ) else {
+                return;
+            };
+            // SAFETY: `slot.row` belongs to this live entity and the erased
+            // column is selected by the same ComponentId used to retrieve the
+            // derive-generated concrete dispatch function.
+            let data = unsafe { column.get_raw(slot.row as usize) };
+
+            mirror
+                .generations()
+                .note_gpu_bearing_insert(entity.index(), entity.generation());
+            let gpu_row = mirror.acquire_gpu_row(cid, entity);
+            let presence_transition = mirror.store().mark_component_present(cid, gpu_row);
+            assert!(
+                presence_transition.is_some(),
+                "GPU-bearing replicated component {cid:?} has no growable presence buffer"
+            );
+            dispatch(
+                mirror,
+                gpu_row,
+                data,
+                None,
+                presence_transition.unwrap_or(false),
+            );
+        }
     }
 
     pub(crate) fn get_or_create_archetype(&mut self, key: ArchetypeKey) -> ArchetypeId {
@@ -1106,5 +1310,68 @@ impl World {
 impl Default for World {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn forged_next_generation_does_not_make_a_free_slot_alive() {
+        let mut world = World::new();
+        let old = world.spawn();
+        assert!(world.despawn(old));
+
+        let forged = Entity::new(old.index(), old.generation() + 1);
+        assert!(
+            !world.is_alive(forged),
+            "matching a free slot's stored generation is not occupancy"
+        );
+        assert!(world.get::<u32>(forged).is_none());
+        assert!(!world.despawn(forged));
+
+        let replacement = world.spawn();
+        assert_eq!(replacement.index(), old.index());
+        assert_eq!(replacement.generation(), forged.generation());
+        assert!(world.is_alive(replacement));
+    }
+
+    #[test]
+    fn exhausted_entity_slot_is_permanently_retired() {
+        let mut world = World::new();
+        let initial = world.spawn();
+        world.entity_slots[initial.index() as usize].generation = u32::MAX - 1;
+        let exhausted = Entity::new(initial.index(), u32::MAX - 1);
+
+        assert!(world.despawn(exhausted));
+        assert!(!world.is_alive(exhausted));
+        assert_eq!(
+            world.entity_slots[initial.index() as usize].generation,
+            u32::MAX
+        );
+        assert_eq!(
+            world.entity_slots[initial.index() as usize].row,
+            crate::entity::DEAD_ROW
+        );
+
+        let next = world.spawn();
+        assert_ne!(next.index(), exhausted.index());
+    }
+
+    #[test]
+    fn replicated_spawn_cannot_issue_retirement_generation() {
+        let mut world = World::new();
+        let retired_generation = Entity::new(0, u32::MAX);
+        assert!(
+            world
+                .force_spawn_in_archetype(
+                    retired_generation,
+                    ArchetypeKey::new(Vec::new()),
+                    |_| None,
+                )
+                .is_none()
+        );
+        assert!(world.entity_slots.is_empty());
     }
 }

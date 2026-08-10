@@ -32,6 +32,7 @@ impl HandleRegistry {
 
     /// Allocate a slot pointing at `row`. Returns the new live handle.
     pub fn allocate(&mut self, row: u32) -> Handle {
+        assert_ne!(row, NULL_ROW, "cannot allocate a handle at the null-row sentinel");
         if let Some(slot) = self.free.pop() {
             let gen = self.generations[slot as usize];
             self.slot_to_row[slot as usize] = row;
@@ -117,14 +118,15 @@ impl HandleRegistry {
     ///
     /// Callers must guarantee `slot` was allocated and is currently live.
     #[inline]
-    pub fn set_row(&mut self, slot: u32, row: u32) {
-        debug_assert!(
+    pub(crate) fn set_row(&mut self, slot: u32, row: u32) {
+        assert_ne!(row, NULL_ROW, "a live slot cannot target the null-row sentinel");
+        assert!(
             (slot as usize) < self.slot_to_row.len(),
             "set_row: slot {} out of range (len={})",
             slot,
             self.slot_to_row.len()
         );
-        debug_assert!(
+        assert!(
             self.slot_to_row[slot as usize] != NULL_ROW,
             "set_row: slot {} is not live (freed or never allocated)",
             slot
@@ -167,6 +169,13 @@ mod tests {
         let h = reg.allocate(7);
         assert_eq!(h.generation(), 1);
         assert_eq!(reg.row_of(h), Some(7));
+    }
+
+    #[test]
+    #[should_panic(expected = "null-row sentinel")]
+    fn allocate_rejects_null_row_sentinel() {
+        let mut reg = HandleRegistry::new();
+        let _ = reg.allocate(NULL_ROW);
     }
 
     #[test]

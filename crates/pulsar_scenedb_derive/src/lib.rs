@@ -7,13 +7,14 @@ mod replicate;
 mod scene_store;
 mod subsystem;
 
-/// Derive `HasTypeToken`, `Pod`, `SceneColumnSet`, and `GpuColumnSet` for a
-/// SceneDB component struct.
+/// Derive `SceneColumnSet` and, when fields are marked `#[gpu]`,
+/// `GpuColumnSet` for a SceneDB component struct.
 ///
 /// # Attributes
 ///
-/// - `#[gpu]` — mark a field as GPU-mirrored (requires the `gpu` feature on
-///   `pulsar_scenedb`).
+/// - `#[gpu]` — mark a field as GPU-mirrored (requires the downstream
+///   dependency to enable `pulsar_scenedb`'s `gpu` feature; the consuming
+///   crate does not need a feature of its own named `gpu`).
 /// - `#[gpu(mirror = Once)]` — one deferred GPU handoff per World component-
 ///   presence lifetime; removal tombstones it and re-insertion hands off again.
 /// - `#[gpu(mirror = DirtyTracked)]` — GPU-mirrored field synced every frame

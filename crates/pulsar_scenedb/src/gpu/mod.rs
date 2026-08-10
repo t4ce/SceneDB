@@ -31,6 +31,52 @@ mod tracker;
 mod view_upload;
 pub mod world_mirror;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, OnceLock};
+
+    struct TestGpuContext {
+        // Keep the native backend chain alive for the whole lib-test process.
+        // The GPU modules run in parallel; one device per test can exhaust a
+        // driver's device heap and also exercises fragile concurrent teardown.
+        _instance: wgpu::Instance,
+        _adapter: wgpu::Adapter,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+    }
+
+    static TEST_GPU: OnceLock<TestGpuContext> = OnceLock::new();
+
+    pub(crate) fn test_gpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
+        let gpu = TEST_GPU.get_or_init(|| {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = pollster::block_on(instance.request_adapter(
+                &wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    apply_limit_buckets: false,
+                },
+            ))
+            .expect("no adapter — GPU tests need a local GPU");
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("scenedb-shared-lib-test-device"),
+                    ..Default::default()
+                }))
+                .expect("device");
+            TestGpuContext {
+                _instance: instance,
+                _adapter: adapter,
+                device: Arc::new(device),
+                queue: Arc::new(queue),
+            }
+        });
+        (Arc::clone(&gpu.device), Arc::clone(&gpu.queue))
+    }
+}
+
 pub use assets::{
     ArenaError, ClusterBuffer, ClusterError, ClusterNode, GeometryArena, MaterialError,
     MaterialRegistry, MaterialRow, MeshError, MeshMetadata, MeshRegistry, MeshletBuffer,
@@ -59,8 +105,8 @@ pub use phase::{
 };
 pub use region::{RegionError, RegionPool};
 pub use scene_store::{
-    CellId, CellSlot, GpuColumnDesc, GpuColumnSet, MirrorMode, RegionClassConfig, SceneGpuConfig,
-    SceneGpuStore,
+    CellId, CellSlot, GpuColumnDesc, GpuColumnSet, GrowableGpuColumnSet, MirrorMode,
+    RegionClassConfig, SceneGpuConfig, SceneGpuStore,
 };
 pub use tracker::SubmissionTracker;
 pub use view_upload::ViewTokenBuffers;

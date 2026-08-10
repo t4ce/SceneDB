@@ -18,7 +18,10 @@ use pulsar_scenedb::gpu::{
     EngineGpuContext, GpuColumnSet, GpuMirrorHandle, RegionClassConfig, SceneGpuConfig,
     SceneGpuStore,
 };
-use pulsar_scenedb::World;
+use pulsar_scenedb::{
+    component_id, encode_archetype_key, ComponentDelta, Delta, Entity, ReplicationCondition,
+    ReplicationEncoding, ReplicationRegistry, World,
+};
 use pulsar_scenedb_derive::SceneStore;
 use std::sync::Arc;
 
@@ -70,7 +73,7 @@ fn scene_cfg() -> SceneGpuConfig {
     }
 }
 
-#[derive(SceneStore, Clone, Copy)]
+#[derive(SceneStore, Clone, Copy, Default)]
 struct MixedModeComponent {
     #[gpu(mirror = Once)]
     mesh_id: u32, // set once at spawn, never changes
@@ -94,6 +97,130 @@ struct DifferentialComponent {
 struct NanComponent {
     #[gpu]
     value: f32,
+}
+
+#[test]
+fn replicated_fields_publish_once_after_cpu_reconstruction() {
+    let ctx = test_context();
+    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+    MixedModeComponent::register_gpu_columns_growable(&mut store, 2, ctx.device());
+    let store = Arc::new(store);
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
+
+    let mut registry = ReplicationRegistry::new();
+    let builder = registry
+        .register::<MixedModeComponent>()
+        .field(
+            "mesh_id",
+            |component| &component.mesh_id,
+            |component| &mut component.mesh_id,
+            ReplicationEncoding::Pod,
+            ReplicationCondition::Always,
+        )
+        .field(
+            "hp",
+            |component| &component.hp,
+            |component| &mut component.hp,
+            ReplicationEncoding::Pod,
+            ReplicationCondition::Always,
+        );
+    registry.insert(builder);
+
+    let entity = Entity::from_bits(0);
+    let owner = component_id::<MixedModeComponent>();
+    let spawn = Delta {
+        frame: 1,
+        base_frame: 0,
+        spawned: vec![(entity, encode_archetype_key(&[owner]))],
+        despawned: Vec::new(),
+        component_deltas: vec![ComponentDelta {
+            entity,
+            component_type: owner,
+            field_data: vec![7u32.to_le_bytes().to_vec(), 99u32.to_le_bytes().to_vec()],
+        }],
+        events: Vec::new(),
+    };
+    spawn.apply(&mut world, &registry).unwrap();
+    let row = world.gpu_row::<MixedModeComponent>(entity).unwrap() as u64;
+    world.flush_gpu_mirror(ctx.queue()).unwrap();
+
+    let columns = MixedModeComponent::gpu_columns();
+    let mesh_id = columns
+        .iter()
+        .find(|column| column.buffer_name == "mesh_id")
+        .unwrap()
+        .field_token
+        .id();
+    let hp = columns
+        .iter()
+        .find(|column| column.buffer_name == "hp")
+        .unwrap()
+        .field_token
+        .id();
+    let mut gpu_mesh = 0;
+    let mut gpu_hp = 0;
+    store.with_once_buffer_for_id(mesh_id, &mut |buffer| {
+        gpu_mesh = readback_u32(&ctx, buffer, row)
+    });
+    store.with_dirty_tracked_buffer_for_id(hp, &mut |buffer| {
+        gpu_hp = readback_u32(&ctx, buffer, row)
+    });
+    assert_eq!((gpu_mesh, gpu_hp), (7, 99));
+
+    let update = Delta {
+        frame: 2,
+        base_frame: 1,
+        spawned: Vec::new(),
+        despawned: Vec::new(),
+        component_deltas: vec![ComponentDelta {
+            entity,
+            component_type: owner,
+            field_data: vec![999u32.to_le_bytes().to_vec(), 55u32.to_le_bytes().to_vec()],
+        }],
+        events: Vec::new(),
+    };
+    update.apply(&mut world, &registry).unwrap();
+    world.flush_gpu_mirror(ctx.queue()).unwrap();
+    store.with_once_buffer_for_id(mesh_id, &mut |buffer| {
+        gpu_mesh = readback_u32(&ctx, buffer, row)
+    });
+    store.with_dirty_tracked_buffer_for_id(hp, &mut |buffer| {
+        gpu_hp = readback_u32(&ctx, buffer, row)
+    });
+    assert_eq!(gpu_mesh, 7, "replicated update cannot rewrite a Once field");
+    assert_eq!(gpu_hp, 55, "replicated DirtyTracked update reaches VRAM");
+
+    let removal = Delta {
+        frame: 3,
+        base_frame: 2,
+        spawned: Vec::new(),
+        despawned: Vec::new(),
+        component_deltas: vec![ComponentDelta {
+            entity,
+            component_type: owner,
+            field_data: Vec::new(),
+        }],
+        events: Vec::new(),
+    };
+    removal.apply(&mut world, &registry).unwrap();
+    assert!(world.get::<MixedModeComponent>(entity).is_none());
+    assert!(world.gpu_row::<MixedModeComponent>(entity).is_none());
+    world.flush_gpu_mirror(ctx.queue()).unwrap();
+    store.with_once_buffer_for_id(mesh_id, &mut |buffer| {
+        gpu_mesh = readback_u32(&ctx, buffer, row)
+    });
+    store.with_dirty_tracked_buffer_for_id(hp, &mut |buffer| {
+        gpu_hp = readback_u32(&ctx, buffer, row)
+    });
+    assert_eq!(
+        (gpu_mesh, gpu_hp),
+        (0, 0),
+        "replicated removal clears both Once and DirtyTracked payloads"
+    );
 }
 
 #[test]
@@ -136,6 +263,70 @@ fn raw_mutable_access_is_rejected_and_copy_edit_dispatches_the_mirror() {
         .unwrap();
     let edited = world.flush_gpu_mirror(ctx.queue()).unwrap();
     assert_eq!((edited.ranges, edited.bytes), (1, 4));
+}
+
+#[test]
+fn allocation_free_bulk_edit_crosses_archetypes_and_dispatches_selected_rows() {
+    let ctx = test_context();
+    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+    DifferentialComponent::register_gpu_columns_growable(&mut store, 8, ctx.device());
+    MixedModeComponent::register_gpu_columns_growable(&mut store, 8, ctx.device());
+    let store = Arc::new(store);
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
+
+    let entities: Vec<_> = (1..=3)
+        .map(|cpu_debug_tag| {
+            let entity = world.spawn();
+            world.insert(
+                entity,
+                DifferentialComponent {
+                    transform_version: 10,
+                    cpu_debug_tag,
+                    material_version: 20,
+                    authored_mesh: 30,
+                },
+            );
+            entity
+        })
+        .collect();
+    // Move one selected component to a different archetype. `edit_each` must
+    // visit both layouts without materialising an entity/update vector.
+    world.insert(
+        entities[1],
+        MixedModeComponent {
+            mesh_id: 7,
+            hp: 9,
+        },
+    );
+    world.flush_gpu_mirror(ctx.queue()).unwrap();
+
+    let mut visited = 0usize;
+    let committed = world.edit_each::<DifferentialComponent>(|_, component| {
+        visited += 1;
+        if component.cpu_debug_tag < 2 {
+            return false;
+        }
+        component.transform_version += 5;
+        true
+    });
+    assert_eq!((visited, committed), (3, 2));
+    let versions: Vec<_> = entities
+        .iter()
+        .map(|&entity| {
+            world
+                .get::<DifferentialComponent>(entity)
+                .unwrap()
+                .transform_version
+        })
+        .collect();
+    assert_eq!(versions, [10, 15, 15]);
+
+    let edited = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!(edited.bytes, 8, "two changed u32 partner rows upload exactly 8 bytes");
 }
 
 #[test]

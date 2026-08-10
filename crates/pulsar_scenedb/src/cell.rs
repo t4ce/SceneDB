@@ -88,39 +88,39 @@ impl CellStorage {
     /// cell so `column_for::<T>()` resolves (M2b-β: `SpatialCell` carries six
     /// same-type bounds columns that CellType's type-keyed tokens cannot
     /// express, plus one token-keyed transform column for the GPU mirror).
-    /// # Aliasing hazard (audit B, GAP-2; β Task 1 review note)
-    ///
-    /// Both guards below are `debug_assert!`, not real checks — in a release
-    /// build, `register_token_column::<T>(wrong_col)` registers a token to
-    /// whatever column `wrong_col` happens to be, with NO error at
-    /// registration time. `Page::assert_column`'s real `assert_eq!` on size
-    /// still catches a *size* mismatch on first read, but if two distinct
-    /// `Pod` types happen to share the same byte size (plausible: many
-    /// 64/128-byte structs), a wrong-column registration silently
-    /// reinterprets one type's bytes as another's — no panic anywhere, ever.
-    ///
-    /// The caller must guarantee `user_col` genuinely addresses a column of
-    /// element type `T` and is not ALSO addressed positionally elsewhere
-    /// (e.g. via `user_column::<U>(user_col)` for some other `U`) — this
-    /// method does not and cannot verify that on its own. Today's only call
-    /// site (`SpatialCell::with_transform`, `spatial.rs`) is self-consistent
-    /// and safe by construction; this is a real weakening of the
-    /// token-keyed-column type-safety story for any FUTURE in-crate caller,
-    /// since this method is `pub(crate)` and the hole is silent. Documented,
-    /// deferred, narrow blast radius today (progress.md, β Task 1 review:
-    /// "register_token_column has no misuse guard against aliasing a
-    /// positional column (safe at today's only call site;
-    /// discipline-guarded)").
+    /// Registration validates the column index and the exact size/alignment
+    /// of `T` in every build mode, and rejects both duplicate tokens and a
+    /// second token claiming the same physical column. A positionally-built
+    /// [`ColumnDesc`] cannot encode Rust `TypeId`, so choosing the intended
+    /// same-layout `Pod` type remains the constructor's semantic
+    /// responsibility; use [`CellStorage::from_cell_type`] when the layout can
+    /// be expressed entirely through typed tokens.
+    #[track_caller]
     pub fn register_token_column<T: crate::page::Pod + 'static>(&mut self, user_col: usize) {
         let id = TypeToken::of::<T>().id();
-        debug_assert!(
+        assert!(
+            user_col < self.user_column_count,
+            "token column index {user_col} is out of range for {} user columns",
+            self.user_column_count
+        );
+        assert!(
             !self.token_index.iter().any(|(tid, _)| *tid == id),
             "token already registered on this cell"
         );
-        debug_assert_eq!(
-            self.page.layout().column_descs()[user_col + 1].size as usize,
+        assert!(
+            !self.token_index.iter().any(|(_, col)| *col == user_col),
+            "physical user column {user_col} already has a registered token"
+        );
+        let desc = self.page.layout().column_descs()[user_col + 1];
+        assert_eq!(
+            desc.size as usize,
             std::mem::size_of::<T>(),
             "token type size does not match the column stride"
+        );
+        assert_eq!(
+            desc.align as usize,
+            std::mem::align_of::<T>(),
+            "token type alignment does not match the column layout"
         );
         self.token_index.push((id, user_col));
     }
@@ -617,5 +617,20 @@ mod tests {
         assert_eq!(c.column_for::<f32>().unwrap()[row], 9.0);
         // u64 is not a user column of this cell type → None.
         assert!(c.column_for::<u64>().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "already has a registered token")]
+    fn positional_column_cannot_be_claimed_by_two_tokens() {
+        let mut c = CellStorage::new(&[ColumnDesc::of::<u32>()], 16).unwrap();
+        c.register_token_column::<u32>(0);
+        c.register_token_column::<f32>(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "token type alignment does not match")]
+    fn token_registration_checks_alignment_in_release_too() {
+        let mut c = CellStorage::new(&[ColumnDesc { size: 8, align: 4 }], 16).unwrap();
+        c.register_token_column::<u64>(0);
     }
 }

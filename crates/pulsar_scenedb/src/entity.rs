@@ -1,11 +1,17 @@
 use std::fmt;
 
+/// Entity-slot row sentinel used while a slot is free or permanently
+/// retired. Unlike an archetype id, a row can represent emptiness without
+/// colliding with the valid empty archetype (which contains live entities).
+pub(crate) const DEAD_ROW: u32 = u32::MAX;
+
 /// A lightweight handle to an entity in the ECS [`World`](crate::World).
 ///
 /// Internally a packed `u64`: the lower 32 bits are the entity index (slot in
 /// [`World::entity_slots`]) and the upper 32 bits are the generation counter.
-/// The generation is incremented each time the slot is recycled, which lets
-/// [`World::is_alive`] reject stale handles.
+/// The generation is advanced when a live slot is despawned, before it enters
+/// the free list. Generation `u32::MAX` permanently retires the slot instead
+/// of wrapping, which lets [`World::is_alive`] reject stale handles forever.
 ///
 /// `Entity` is `Copy`, cheap to pass around, and `DANGLING` can be used as
 /// a sentinel value.
@@ -27,8 +33,10 @@ impl Entity {
 
     /// The generation counter for stale-handle detection.
     ///
-    /// Each time a slot is recycled the generation is incremented.  An entity
-    /// handle is alive iff `handle.generation() == world.entity_slots[handle.index()].generation`.
+    /// Each despawn advances the slot generation. A handle is alive only when
+    /// both its generation matches and the slot is currently occupied; a free
+    /// slot never becomes live merely because forged bits match its next
+    /// generation.
     #[inline]
     pub fn generation(self) -> u32 {
         (self.0 >> 32) as u32
@@ -36,9 +44,9 @@ impl Entity {
 
     /// Sentinel value for a dead or null entity.
     ///
-    /// `u64::MAX` â€” guaranteed not to collide with any valid entity because
-    /// entity indices are bounded by the slot-vec length.  Useful as an
-    /// initialiser for option-like patterns without heap allocation.
+    /// `u64::MAX` — guaranteed not to collide with any valid entity because
+    /// generation `u32::MAX` is reserved for permanent retirement. Useful as
+    /// an initializer for option-like patterns without heap allocation.
     pub const DANGLING: Entity = Entity(u64::MAX);
 
     /// Raw packed u64 representation (for serialization).
@@ -78,7 +86,7 @@ impl EntitySlot {
         Self {
             generation,
             archetype: crate::archetype::ArchetypeId::EMPTY,
-            row: 0,
+            row: DEAD_ROW,
         }
     }
 }

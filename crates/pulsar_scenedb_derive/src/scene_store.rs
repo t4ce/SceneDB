@@ -186,8 +186,8 @@ pub struct FieldInfo {
     /// to the field's own type) and using *that* — not the raw field type
     /// — as the column's registered type everywhere: `GpuColumnDesc::
     /// field_token`, the `write_gpu`-generated `component_id::<_>()` call,
-    /// and (when the `gpu` feature is on) the `SceneColumnSet`-generated
-    /// `CellType` column token. A wrapper's own `TypeId` is unique to its
+    /// and the GPU-bearing `SceneColumnSet`-generated `CellType` column
+    /// token. A wrapper's own `TypeId` is unique to its
     /// (struct, field) pair by construction, so two `#[gpu] f32` fields on
     /// different structs get two distinct CPU-column `ComponentId`s even
     /// though their underlying data is the same shape. An explicit
@@ -358,13 +358,13 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let is_packed = struct_is_packed(&input.attrs);
     validate_gpu_buffer_names(&gpu_fields, is_packed)?;
 
-    // Two `SceneColumnSet` impls, `cfg`-split on the `gpu` feature: with it
-    // on, `#[gpu]` fields' CellType column tokens must match the wrapper
-    // types `write_gpu`/`GpuColumnDesc` use (see `gpu_wrapper`'s doc) or
-    // `cell.column_for_mut::<Wrapper>()` would find no column; with it off
-    // there is no GPU column concept at all, so every field (including ones
-    // marked `#[gpu]`, which is a no-op without the feature) keeps its own
-    // natural type -- unchanged from before this fix.
+    // A type that explicitly contains `#[gpu]` fields always emits the GPU
+    // partner contract. Do not inspect a feature named `gpu` in the consuming
+    // crate: proc-macro output is compiled there, where that ambient feature
+    // may be unrelated or absent and previously made the marker silently act
+    // like a CPU-only field. The dependency's own `pulsar_scenedb/gpu`
+    // feature is the real capability gate. CPU-only derives emit only their
+    // natural SceneColumnSet and never reference the gated GPU module.
     let scene_column_set_gpu = generate_scene_column_set(
         name,
         &impl_generics,
@@ -404,6 +404,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     ::pulsar_scenedb::bytemuck::Zeroable,
                     ::pulsar_scenedb::bytemuck::Pod,
                 )]
+                #[bytemuck(crate = "::pulsar_scenedb::bytemuck")]
                 pub struct #wrapper(pub #ty);
                 unsafe impl ::pulsar_scenedb::page::Pod for #wrapper {}
             }
@@ -422,16 +423,19 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     // `pulsar_scenedb::token` covers `T: Pod + 'static`, which our Pod impl
     // satisfies.  An explicit impl would conflict.
 
-    Ok(quote! {
-        #[cfg(feature = "gpu")]
-        const _: () = {
-            #(#gpu_wrapper_defs)*
-            #scene_column_set_gpu
-            #gpu_column_set
-        };
-        #[cfg(not(feature = "gpu"))]
-        #scene_column_set_no_gpu
-    })
+    if gpu_fields.is_empty() {
+        Ok(quote! {
+            #scene_column_set_no_gpu
+        })
+    } else {
+        Ok(quote! {
+            const _: () = {
+                #(#gpu_wrapper_defs)*
+                #scene_column_set_gpu
+                #gpu_column_set
+            };
+        })
+    }
 }
 
 #[cfg(test)]

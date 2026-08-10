@@ -52,6 +52,15 @@ impl ArchetypeKey {
 
     pub fn without<T: Component>(&self) -> Self {
         let cid = crate::component::component_id::<T>();
+        self.without_id(cid)
+    }
+
+    /// Return this key without the component identified by `cid`.
+    ///
+    /// This is the type-erased counterpart to [`Self::without`], used by
+    /// replication when a wire delta removes a component whose concrete
+    /// Rust type is known only to the registered column.
+    pub(crate) fn without_id(&self, cid: ComponentId) -> Self {
         let ids: Vec<_> = self.0.iter().copied().filter(|c| *c != cid).collect();
         Self(ids)
     }

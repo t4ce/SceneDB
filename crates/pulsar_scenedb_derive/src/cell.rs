@@ -6,12 +6,11 @@ use crate::scene_store::FieldInfo;
 
 /// `use_gpu_wrappers` picks which type each `#[gpu]` field's CellType
 /// column token is declared for: the field's own generated wrapper type
-/// (when the `gpu` feature is on -- must match what `write_gpu`/
-/// `GpuColumnDesc` use, see `FieldInfo::gpu_wrapper`'s doc) or the field's
-/// raw type (when it's off -- there is no GPU column concept at all, so
-/// every field, `#[gpu]`-marked or not, keeps its natural type). Callers
-/// pass `true`/`false` and `#[cfg]`-gate the two resulting impls
-/// themselves (see `scene_store::expand`).
+/// for a GPU-bearing component (which must match what `write_gpu` and
+/// `GpuColumnDesc` use; see `FieldInfo::gpu_wrapper`), or the field's raw
+/// type for a CPU-only component. `scene_store::expand` selects this from
+/// the component's actual fields, never from an ambient feature in the
+/// consuming crate.
 pub fn generate_scene_column_set(
     name: &Ident,
     impl_generics: &syn::ImplGenerics,

@@ -139,19 +139,16 @@ fn world_insert_past_initial_capacity_does_not_panic_and_reads_back_correctly() 
 }
 
 #[test]
-fn non_gpu_component_still_registers_a_growable_stub_with_no_effect() {
-    // GrowableTagComponent's own register_gpu_columns_growable is exercised
-    // above; this proves a type with ZERO #[gpu] fields also gets a valid
-    // (no-op) register_gpu_columns_growable, so generic code that calls it
-    // uniformly across every #[derive(SceneStore)] type doesn't need to
-    // special-case "has no #[gpu] fields."
+fn non_gpu_component_exposes_only_its_cpu_column_contract() {
+    // A type with zero #[gpu] fields must not emit references to SceneDB's
+    // feature-gated GPU API: the same expansion has to compile when the
+    // dependency is built without `gpu`. It still owns its natural CPU SoA
+    // column contract.
     #[derive(SceneStore, Clone, Copy)]
     struct NoGpuFields {
         value: u32,
     }
 
-    let ctx = test_context();
-    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
-    NoGpuFields::register_gpu_columns_growable(&mut store, 4, ctx.device());
-    assert!(NoGpuFields::gpu_columns().is_empty());
+    let cell_type = <NoGpuFields as pulsar_scenedb::SceneColumnSet>::cell_type();
+    assert_eq!(cell_type.user_column_count(), 1);
 }

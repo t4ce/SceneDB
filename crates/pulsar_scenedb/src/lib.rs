@@ -1,67 +1,28 @@
-//! SceneDB 2.0 — Layer 1 storage core (spec Rev 2.3, CONTRACTS.md C0–C6;
-//! C5 material layout pending M3-β (R8-gated), Test 13 pending M3-β).
+//! SceneDB is an in-memory scene database with two complementary CPU storage
+//! models:
 //!
-//! - [`Handle`] — packed u64, stable slot index + generation, gen 0 invalid
-//! - [`HandleRegistry`] — slot allocator, generation validation, slot→row
-//!   indirection, permanent retirement at gen `u32::MAX`
-//! - [`Page`]/[`PageLayout`] — single-allocation 64-byte-aligned SoA pages,
-//!   128-byte stride guardrail, 1024-element ceiling
-//! - [`LivenessMask`] — atomic per-element liveness, deferred deletion
-//! - [`CellStorage`] — alloc/free/deref + frame-boundary swap-and-pop
-//!   compaction that preserves handle validity
-//! - [`SpatialCell`] — six SoA bounds columns + the §8 AABB query writing
-//!   sentinel-aligned row tokens into caller scratch (scalar reference;
-//!   SIMD paths land in M1b and must match bit-for-bit)
-//! - [`TypeToken`]/[`CellType`] — dense column-type tokens bridged to
-//!   `pulsar_reflection`; holistic-stride-checked cell composition
-//! - SIMD query dispatch (internal `simd` kernels) — AVX2 arms verified
-//!   bit-for-bit against the scalar reference; frustum + AABB
-//! - [`LeaseMask`]/[`Scratchpad`]/[`LivenessSnapshot`] — read-lease pool,
-//!   decaying scratchpads, double-buffered revocation (§9; phase machine is M2)
-//! - `gpu` (feature `gpu`) — M2a/M2b GPU-resident store: `EngineGpuContext`,
-//!   `SceneBuffer<T>` row-indexed SSBOs with coalescing delta-sync (M2a);
-//!   M2b-α adds region-partitioned global buffers, size-class pools (C2
-//!   default 256 / max 1024 per class), per-cell `CellGpuState` (dirty masks,
-//!   pending retires, gen shadow, slot shadow), self-healing slot-mirror
-//!   boundary scan, `register_cell` promotion primitive, `rebuild` for device
-//!   loss. Asset store (M2b-α): `GeometryArena` RangeList suballocation,
-//!   `MeshRegistry` (C5: 72 B, XOR-validated), `ClusterBuffer` (C5: 48 B,
-//!   NaN-rejecting error-monotonicity validation), both with corrupted-VRAM
-//!   rebuild gates. Phase machine (M2b-α):
-//!   `FrameDriver` → SimulateA→SimulateB→Harvest→Boundary witnesses;
-//!   `BoundaryPhase::retire` returns drain count; compile_fail + positive
-//!   doc-tests enforce correctness. The core stays graphics-free (C0); CI
-//!   guards `--no-default-features`.
+//! - [`World`] is the archetype/component authority used for general authored
+//!   scene data, typed queries, relations, schedules, and registered subsystems.
+//! - [`CellStorage`] and [`SpatialCell`] provide fixed paged SoA storage for
+//!   streaming, SIMD spatial queries, and handle-addressed cell workloads.
 //!
-//! The inherited archetype ECS modules (`world`, `archetype`, `query`, …)
-//! are retained and will be migrated onto paged storage in later milestones
-//! (the SceneDB-replaces-ECS path, design doc §7).
+//! [`Entity`] identities belong to `World`; [`Handle`] identities belong to the
+//! paged cell path. Neither physical archetype rows nor GPU partner rows are
+//! derived from an `Entity` index.
 //!
-//! Milestone status: M1 (Layer 1) complete; M2a (GPU store, delta-sync,
-//! pin-by-serial retirement) complete — verified headless by Tests 3, 6 (host),
-//! and 14. M2b-α (region-partitioned `SceneGpuStore`, asset store, phase
-//! machine, compile-time correctness gates) complete — verified by Tests 3, 6,
-//! 14 extended suites and compile_fail doc-tests. M2b-β (streaming grid
-//! domains/hysteresis/cross-fade/budget, region-recycle promotion/eviction
-//! with serial-pinned eviction and recycled-region tail scrub, no-alloc
-//! `query_*_in` harvest seams, `HarvestPipeline`/DEI dense compaction, lease
-//! timeout/revocation) **complete** — verified by Test 10 (lease
-//! timeout/revocation), Test 11 (`StreamingGrid` domains/hysteresis/budget —
-//! carried as inline `#[cfg(test)]` modules under the `gpu` feature, not a
-//! `tests/` integration binary; its command is `cargo test -p pulsar_scenedb
-//! --features gpu --lib`, README's test-command matrix), Test 12 (DEI scalar
-//! + AVX2 bit-identity), the D2-tail carry-forward (recycled-region
-//! generation scrub), and eviction serial-pinning, on top of the α suites
-//! above. M3-α (wgpu-30 alignment, `SceneDbBinding` seam) **complete** —
-//! `gpu` feature migrated onto upstream crates.io `wgpu = "30"` (own dep;
-//! the workspace fork stays for legacy consumers until M4), instance-info
-//! mirrored column, `TextureStore`, `MeshletBuffer` (C5 32 B), asset-store
-//! upload counters (Test 13 instrumentation), expected-generation harvest
-//! column (Test 2 data path), and the `helio-scenedb` binding seam vendored
-//! as a standalone submodule (`crates/renderer/helio`, no `[patch]`) with
-//! its own Test 3 reflection harness — Tasks 1-10 and 12. Material buffer
-//! (Task 11) is **gated on Rev 2.4 R8** (unapproved as of M3-α) and carries
-//! to M3-β. M3-β (cull/indirect passes, Tests 13/2/4/5) is next.
+//! With the `gpu` feature, `SceneGpuStore` supports both fixed cell mirrors and
+//! growable `World` component partners. A `#[gpu]` field defaults to
+//! `DirtyTracked`: the CPU component remains canonical and changed
+//! component-local rows are uploaded on flush. `#[gpu(mirror = Once)]` is an
+//! explicit one-time handoff per component-presence lifetime and retains only
+//! transient pending values, not a capacity-sized CPU shadow. Named buffer
+//! identities, reflection descriptors, presence rows, and the separate
+//! entity-generation buffer let renderers bind these publications without
+//! taking scene-data ownership.
+//!
+//! The crate also provides streaming/phase primitives, asset-oriented GPU
+//! subsystems, and experimental local replication building blocks. The core
+//! remains graphics-free when built without the `gpu` feature.
 
 pub mod actor;
 pub mod archetype;
@@ -104,20 +65,23 @@ pub use archetype::{Archetype, ArchetypeId, ArchetypeKey};
 pub use cell::CellStorage;
 pub use cell_type::{CellType, CellTypeError, RegisteredCellType, SceneColumnSet};
 pub use component::{component_id, Component, ComponentId};
-pub use component_store::{ComponentStore, __bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp};
+pub use component_store::{
+    __bp_clear_comp_ctx, __bp_set_comp_ctx, __bp_with_comp, __bp_with_comp_ctx, ComponentStore,
+};
 pub use entity::Entity;
 #[cfg(feature = "gpu")]
 pub use gpu::{
     gpu_column_descs_for_component, CapacityError, DescriptorsFn, DirtyTrackedGpuBufferDispatch,
     DirtyTrackedSceneBuffer, DynamicGpuBuffer, GenerationMirror, GpuBufferDispatch, GpuColumnDesc,
     GpuColumnSet, GpuMirrorHandle, GpuMirrorRegistration, GrowableGpuBufferDispatch,
-    GrowableSceneBuffer, MirrorMode,
+    GrowableGpuColumnSet, GrowableSceneBuffer, MirrorMode,
 };
 // Re-exported so `#[derive(SceneStore)]`'s generated code (which lands in
 // whatever crate uses the derive, not here) can reach `inventory::submit!`
 // via `::pulsar_scenedb::pulsar_reflection::inventory` without that crate
-// needing its own direct `pulsar_reflection` dependency — same reasoning
-// `wgpu` re-exports work by for `#[gpu]` field types.
+// needing its own direct `pulsar_reflection` dependency. The `wgpu`
+// re-export below serves the same purpose for generated registration
+// signatures.
 pub use handle::Handle;
 pub use lease::{Lease, LeaseMask, Scratchpad, DECAY_FRAMES, LEASE_SLOTS};
 pub use liveness::LivenessMask;
@@ -130,6 +94,13 @@ pub use page::{
 // direct dependency merely to name the derive traits.
 #[doc(hidden)]
 pub use bytemuck;
+// `SceneStore` expansions live in downstream crates. Route their GPU type
+// paths through the same dependency instance SceneDB was compiled with so an
+// extension crate does not need a second direct/version-sensitive `wgpu`
+// dependency merely for generated registration signatures.
+#[cfg(feature = "gpu")]
+#[doc(hidden)]
+pub use wgpu;
 pub use pulsar_reflection;
 pub use query::{QueryIter, QueryIterMut, WorldQuery, WorldQueryMut};
 pub use registry::{HandleRegistry, NULL_ROW};

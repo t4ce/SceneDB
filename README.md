@@ -6,9 +6,16 @@
 
 GPU-native ECS and spatial database for game engines, built in Rust.
 
-SceneDB is what you get when you decide your entity storage should be a database, not a bag of loose objects. Everything lives in cache-friendly SoA pages on the CPU side — paged storage, spatial bounds, SIMD queries, the streaming grid, and the phase machine all run on the CPU. Only the GPU-mirrored fields (transform columns, instance info, generation buffers, slot mirrors) use delta-sync — the CPU-side fields like bounds columns stay on the CPU and never touch VRAM, and handles are stable u64s with generation counters so compaction never leaves you with a dangling pointer. SIMD spatial queries (AVX2, NEON), a streaming grid that decides what's resident based on where players are standing, persistent region pinning, and a compile-time frame phase machine that makes invalid state transitions unrepresentable.
+SceneDB is what you get when you decide your entity storage should be a database, not a bag of loose objects. It intentionally provides two CPU storage models: the archetype `World` is the authority for general components and typed subsystems, while `CellStorage`/`SpatialCell` provide fixed cache-friendly SoA pages for streaming and SIMD spatial workloads. Both are in-memory data structures, not filesystem or SQL databases.
 
-SceneDB also provides a complete replication primitive suite — change tracking, delta encoding, interest management, authority, events/RPCs, snapshots, and client-side prediction reconciliation — so multiplayer and multi-user-editor support is built into the data layer rather than bolted on as an afterthought.
+Only fields explicitly marked `#[gpu]` gain GPU partners. `DirtyTracked` fields keep their canonical CPU component value and upload changed component-local rows; `Once` fields perform one explicit handoff per presence lifetime without retaining a capacity-sized CPU value shadow. CPU-only fields consume no VRAM. `World` entities and paged-cell handles are generation-checked in their own identity domains, so compaction never leaves a dangling public reference.
+
+SceneDB also provides experimental local replication building blocks — change tracking,
+schema/codec helpers, interest management, authority, events/RPCs, snapshots, and
+prediction reconciliation. They are useful inside one process, but the current raw
+`Delta`/handshake representation is not a production cross-process protocol: component
+IDs are process-local and tracked drains do not yet encode complete final values. See
+[Replication primitives](#replication-primitives) before using these APIs.
 
 ```mermaid
 flowchart LR
@@ -53,17 +60,24 @@ flowchart LR
 
 ## Architecture
 
-SceneDB is layered. The bottom is a paged storage engine: fixed-capacity SoA pages (256 rows default, 1024 max) with 64-byte aligned columns and a 128-byte per-element stride ceiling. Each row gets a `Handle` — a packed u64 with a slot index, generation counter, and type tag. Swap-and-pop compaction at frame boundaries rearranges physical rows without breaking handles.
+SceneDB has two complementary CPU data paths. `World` stores ordinary components in archetypes and is the canonical authority for entity-backed scene data and registered subsystems. The paged path uses fixed-capacity SoA pages (256 rows default, 1024 max) with 64-byte aligned columns and a 128-byte per-element stride ceiling. Each paged row gets a `Handle` — a packed u64 with a slot index, generation counter, and type tag. Swap-and-pop compaction at frame boundaries rearranges physical rows without breaking those handles.
 
 The spatial layer wraps a page with six dedicated f32 columns for AABB min/max per axis. Queries scan directly over the column arrays — no per-entity iteration, no allocation in the hot path. The SIMD layer accelerates these with AVX2 (x86) and NEON (ARM), plus a scalar reference implementation that the vectorized paths must match bit-for-bit. Both AABB and frustum queries are supported.
 
 The streaming grid classifies cells into Outer, Margin, or Inner domains using a concentric distance model with hysteresis bands that damp boundary jitter. You pass a slice of observer AABBs, so multiple players with overlapping load areas work correctly — a cell promotes if any player is close enough and demotes only when all players have left. Cells can also be pinned to any domain directly, bypassing the distance-based rules entirely. Both modes coexist on the same grid.
 
-On the GPU side, a `SceneGpuStore` manages region-partitioned SSBOs shared across every registered cell. Delta-sync uploads only the rows that changed since the last sync. A generation buffer and slot mirror live in VRAM for GPU-side handle validation, with bulk rebuild for device loss recovery. The harvest pipeline runs per-view spatial queries (one staging array per view, no shared state) and routes hits into mesh-class buckets for indirect draw dispatch.
+On the GPU side, `SceneGpuStore` supports fixed region-partitioned cell buffers and growable `World` component partners. World partners use stable component-local rows and an explicit presence buffer; they are never addressed by `Entity::index()`. The entity-generation buffer is the separate exception, indexed by entity index solely for liveness validation. Delta-sync uploads dirty rows, `Once` performs a transient handoff, and allocation epochs let consumers rebuild bindings after growth. The harvest pipeline runs per-view spatial queries and routes cell hits into mesh-class buckets for indirect draw dispatch.
 
 A compile-time frame phase machine enforces the ordering: you hold a `SimulateWitness` to write, a `HarvestPhase` to read back, and a `RetiredPhase` to compact. Pass the wrong witness to a function and it won't compile. No runtime checks, no phase-order bugs.
 
-On top of the storage and phase machine, the **replication layer** provides the primitives needed for server-authoritative multiplayer and multi-user-editor sessions. It records every mutation during Simulate (change tracking), encodes field deltas per a component schema (delta encoding), filters which client sees what (interest management + conditions), resolves who is allowed to write what (authority table), handles one-shot RPCs (event channel), and supports client-side prediction with server reconciliation (snapshots + reconciler). All primitives are graphics-free (C0) and work with `--no-default-features`.
+On top of the storage and phase machine, the **experimental replication layer** provides
+local primitives from which an engine can build server-authoritative multiplayer or a
+multi-user editor: mutation tracking, per-field codecs, interest conditions, authority,
+events, snapshots, and reconciliation. These pieces are graphics-free (C0) and work with
+`--no-default-features`, but they are not yet wired into one reconstructible, negotiated
+wire protocol. In particular, `ChangeTracker::drain_with_world` records structural/dirty
+state rather than complete encoded component values, and raw component IDs cannot be
+shared safely between independently started processes.
 
 ```mermaid
 flowchart LR
@@ -185,9 +199,25 @@ This expands to:
 
 #### Per-field storage location with `#[gpu(mirror = ...)]`
 
-Every field lives in CPU SoA columns by default. Adding `#[gpu]` creates an additional GPU-side mirror (SSBO column in `SceneGpuStore`). The `#[derive(SceneStore)]` macro only looks for `#[gpu]` attributes — any other attribute (`#[replicate]`, `#[serde]`, etc.) passes through unmodified.
+In the paged `CellStorage` path, fields live in CPU SoA columns. In `World`, the
+whole component row remains the canonical CPU value. Adding `#[gpu]` describes
+an additional GPU partner for the selected field in either path; it never moves
+authored ownership out of SceneDB. The `#[derive(SceneStore)]` macro only looks
+for `#[gpu]` attributes—any other attribute (`#[replicate]`, `#[serde]`, etc.)
+passes through unmodified.
 
-| Attribute | CPU column | GPU mirror | Sync mode | Use case |
+Enable `gpu` on the `pulsar_scenedb` dependency when a component contains a
+`#[gpu]` field. The consuming crate does **not** need to declare its own Cargo
+feature named `gpu`: derive output follows the dependency capability and never
+inspects an unrelated ambient feature. Generated registration signatures use
+SceneDB's `wgpu` re-export, and the generated wrappers and inventory entries
+likewise use SceneDB's `bytemuck` and reflection re-exports, so deriving a GPU
+partner does not require direct dependencies on those implementation crates.
+Conversely, a type with no `#[gpu]` fields emits only `SceneColumnSet`; it does
+not synthesize `GpuColumnSet` or no-op GPU registration methods. That keeps the
+same CPU-only expansion valid when the SceneDB dependency disables `gpu`.
+
+| Attribute | Canonical CPU value | GPU partner | Sync mode | Use case |
 |---|---|---|---|---|
 | *(none)* | Yes | No | — | Bounds, metadata, editor-only data |
 | `#[gpu]` | Yes | Yes | `DirtyTracked` | Per-frame transforms, instance data |
@@ -357,6 +387,16 @@ pub struct AiState {
 
 ### Combining `#[gpu]` and `#[replicate]` on the same field
 
+> [!WARNING]
+> `#[replicate]` currently builds a useful **local schema**, but SceneDB's
+> legacy handshake/`Delta` format is not yet a supported cross-process
+> protocol. Component IDs are process-local, no stable schema negotiation is
+> performed, tracked drains do not encode every final field value, and an
+> empty encoded field is ambiguous with the sparse-change sentinel. The ECS
+> and GPU behavior described here is complete; treat the replication half as
+> experimental until stable schema keys plus explicit `Set`/`Patch`/`Remove`
+> operations land.
+
 `#[derive(SceneStore)]` only processes `#[gpu(...)]` attributes; `#[derive(Replicate)]` only processes `#[replicate(...)]` attributes. They're independent derives that coexist on the same struct (and even the same field) because each only looks at its own attributes — stack both:
 
 ```rust
@@ -364,7 +404,7 @@ use pulsar_scenedb_derive::{SceneStore, Replicate};
 use pulsar_scenedb::ReplicationEncoding::*;
 use pulsar_scenedb::ReplicationCondition::*;
 
-/// A mesh instance that is both GPU-native AND replicated over the network.
+/// A mesh instance that is GPU-native and included in a local replication schema.
 /// SceneStore generates column metadata + GPU dispatch for the #[gpu]
 /// fields; Replicate generates `register_replication` from #[replicate]. `Default`
 /// is required by `Replicate` — it's how a freshly-spawned entity gets a
@@ -372,13 +412,13 @@ use pulsar_scenedb::ReplicationCondition::*;
 #[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
 pub struct MeshInstance {
-    /// GPU-mirrored (dirty-tracked every frame) AND network-replicated as a
-    /// GPU handle (only the 8-byte handle index travels, not the vertex data).
+    /// GPU-mirrored (dirty-tracked every frame) and declared as an
+    /// asset-key field. The mesh payload stays out-of-band.
     #[gpu]
     #[replicate(encoding = GpuHandle, condition = Always)]
-    pub mesh: Handle<Mesh>,
+    pub mesh_asset_key: u64,
 
-    /// GPU-mirrored (uploaded once) AND network-replicated only at spawn.
+    /// GPU-mirrored (uploaded once) and declared InitialOnly in the schema.
     #[gpu(mirror = Once)]
     #[replicate(encoding = Pod, condition = InitialOnly)]
     pub base_transform: [f32; 16],
@@ -389,17 +429,17 @@ pub struct MeshInstance {
 }
 ```
 
-Every `#[replicate(...)]` field's type must implement `Replicable` (see below) — every `Pod` type already does via a blanket impl, which covers all three fields above (`Handle<Mesh>`, `[f32; 16]`, and `f32` are all Pod).
+Every `#[replicate(...)]` field's type must implement `Replicable` (see below) — every `Pod` type already does via a blanket impl, which covers all three fields above (`u64`, `[f32; 16]`, and `f32` are all Pod). SceneDB's paged `Handle` is intentionally non-generic; application asset references should use an explicit reviewed packed representation such as the `u64` key above.
 
 The `#[gpu]` and `#[replicate]` attributes are orthogonal:
 
 | Storage (via `#[gpu]`) | Replication (via `#[replicate]`) | Result |
 |---|---|---|
 | *(none)* | *(none)* | CPU-only, never replicated |
-| *(none)* | `GpuHandle` | CPU-only on server, handle sent over wire, remote resolves locally |
+| *(none)* | `GpuHandle` | CPU-only asset key, raw field bytes in the local codec |
 | `#[gpu]` | *(none)* | GPU mirror, never replicated |
-| `#[gpu]` | `Always` | GPU mirror + network-replicated every frame |
-| `#[gpu(mirror = Once)]` | `InitialOnly` | GPU mirror (once) + network-replicated once at spawn |
+| `#[gpu]` | `Always` | GPU mirror + local replication-schema field |
+| `#[gpu(mirror = Once)]` | `InitialOnly` | GPU mirror (once) + InitialOnly schema field |
 
 ### `#[replicate(...)]` — Replication schema on fields
 
@@ -431,9 +471,9 @@ struct PlayerState {
     #[replicate(encoding = Serialized, condition = InitialOnly)]
     inventory: Vec<Item>,
 
-    /// GPU resource handle: only the 8-byte index travels, not the mesh data.
+    /// Stable application asset key; the mesh payload stays out-of-band.
     #[replicate(encoding = GpuHandle, condition = Always)]
-    mesh: Handle<Mesh>,
+    mesh_asset_key: u64,
 
     /// One-shot event: never in state deltas, delivered via RPC channel.
     /// Event fields don't need `Replicable` — they're never stored in a
@@ -455,9 +495,8 @@ use pulsar_scenedb_derive::{SceneStore, Replicate};
 use pulsar_scenedb::ReplicationEncoding::*;
 use pulsar_scenedb::ReplicationCondition::*;
 
-/// A fully wired engine component: SceneStore generates column metadata and
-/// GPU dispatch,
-/// Replicate generates the replication schema for the delta encoder.
+/// A GPU-wired component with a local replication schema: SceneStore generates
+/// column metadata and GPU dispatch; Replicate generates field codec metadata.
 #[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
 struct Character {
@@ -474,9 +513,9 @@ struct Character {
     #[replicate(encoding = DeltaCompressed, condition = SimulatedOnly)]
     health: f32,
 
-    /// Always relevant, GPU handle only.
+    /// Always-relevant stable application asset key.
     #[replicate(encoding = GpuHandle, condition = Always)]
-    skinned_mesh: Handle<SkinnedMesh>,
+    skinned_mesh_asset_key: u64,
 
     /// One-shot RPC: play an animation on all clients.
     #[replicate(encoding = Event, condition = Multicast)]
@@ -503,7 +542,7 @@ registry.insert(
         .field("position", |c: &Character| &c.position, |c: &mut Character| &mut c.position, Pod, ServerAuthority)
         .field("look_direction", |c: &Character| &c.look_direction, |c: &mut Character| &mut c.look_direction, Pod, ClientAuthority)
         .field("health", |c: &Character| &c.health, |c: &mut Character| &mut c.health, DeltaCompressed, SimulatedOnly)
-        .field("skinned_mesh", |c: &Character| &c.skinned_mesh, |c: &mut Character| &mut c.skinned_mesh, GpuHandle, Always)
+        .field("skinned_mesh_asset_key", |c: &Character| &c.skinned_mesh_asset_key, |c: &mut Character| &mut c.skinned_mesh_asset_key, GpuHandle, Always)
         .event("on_play_animation", Multicast, EventChannel::ReliableOrdered)
 );
 ```
@@ -575,13 +614,29 @@ struct FactionVisibility {
     #[replicate(encoding = Pod, condition = SkipOwner)]
     fog_of_war_reveal: [f32; 3],
     #[replicate(encoding = GpuHandle, condition = SimulatedOnly)]
-    proxy_mesh: Handle<ProxyMesh>,
+    proxy_mesh_asset_key: u64,
 }
 ```
 
 ---
 
 ## Replication primitives
+
+> [!CAUTION]
+> **Experimental local primitives, not a production cross-process wire
+> protocol.** `ComponentId` is assigned by first registration in each process,
+> while the current handshake and all serialized deltas/snapshots/events carry
+> that raw number. `from_handshake` parses a descriptor view; it does not bind
+> sender IDs to local component types or codec closures. In addition,
+> `drain_with_world` captures spawn structure and dirty markers but does not
+> encode every component's final values, empty field encodings are ambiguous,
+> and a legacy patch cannot add a missing component to an existing entity.
+>
+> The local tracker, codecs, filtering, authority, snapshots, events, and
+> reconciliation utilities remain useful in one process. A supported network
+> protocol requires stable schema keys/versions, negotiated wire-to-local IDs,
+> and explicit operations with explicit field presence. This limitation does
+> not affect SceneDB's ECS, GPU mirrors, or Helio integration.
 
 ### Schema registration
 
@@ -627,9 +682,10 @@ registry.insert(
     builder.whole_field("value", ReplicationEncoding::DeltaCompressed, ReplicationCondition::SimulatedOnly)
 );
 
-// Serialize schemas for the connection handshake.
+// Serialize/parse the legacy descriptor format for local inspection/tests.
+// This is NOT cross-process type negotiation.
 let handshake = registry.handshake_message();
-let remote_registry = ReplicationRegistry::from_handshake(&handshake).unwrap();
+let descriptor_view = ReplicationRegistry::from_handshake(&handshake).unwrap();
 ```
 
 ### Replicating non-`Pod` data — the `Replicable` trait
@@ -644,7 +700,7 @@ pub trait Replicable: Sized {
 }
 ```
 
-Any `Pod` type gets this for free via a blanket impl (plain memcpy). `String`, `Vec<T: Replicable>`, `Option<T: Replicable>`, and `[f32; 2/3/4]` are provided out of the box, self-framing so they compose (`Vec<String>`, `Option<Vec<u32>>`, etc. all just work). This is what makes owned/heap data — not just `Pod` scalars — safe to replicate: `replicate_decode` returns a real, safely-constructed `Self`, never a byte-for-byte reinterpretation of network garbage.
+Any `Pod` type gets this for free via a blanket impl (plain memcpy). `String`, `Vec<T: Replicable>`, `Option<T: Replicable>`, and `[f32; 2/3/4]` are provided out of the box, self-framing so they compose (`Vec<String>`, `Option<Vec<u32>>`, etc.). At the value-codec level, `replicate_decode` safely constructs a real `Self` rather than reinterpreting untrusted bytes. This does not remove the wire-identity and operation-format limitations called out above.
 
 > [!CAUTION]
 > **`Box<T>` cannot get a blanket `Replicable` impl — you'll need to write one by hand for your specific boxed type.**
@@ -699,11 +755,11 @@ let delta = witness.run_tracked(&mut world, &mut tracker, |world, tracker| {
     world.insert_tracked(entity, 100.0f32, tracker);
 });
 
-// delta contains: spawned entities, despawned entities, component changes —
-// each already encoded via the field's own `Replicable` impl.
+// delta contains final structural events plus legacy component dirty markers.
+// It does not yet encode every final field value automatically.
 ```
 
-Lower-level building blocks are still there if you're driving the frame loop yourself: `tracker.drain_with_world(&world)` does the draining step alone (real archetype-key blobs, no frame advance); the even lower-level `tracker.drain(&schema, client, &authority)` ignores all three arguments and produces a placeholder (non-reconstructible) spawn blob — prefer `drain_with_world` unless you specifically don't have a `World` reference at the call site.
+Lower-level building blocks are still there if you're driving the frame loop yourself: `tracker.drain_with_world(&world)` records real process-local archetype-key blobs (but not complete final values); the even lower-level `tracker.drain(&schema, client, &authority)` ignores all three arguments and produces a placeholder, non-reconstructible spawn blob. Neither is a complete cross-process encoder today.
 
 ### Interest management and condition filtering
 
@@ -798,7 +854,12 @@ can_send_event(&ReplicationCondition::Multicast, sender, recipient);
 
 ### Snapshots
 
-Capture a full or filtered world state for initial replication or recovery, and restore one back into a `World` — the actual resync mechanism for a client that has missed one or more `Delta`s. A `Delta` only carries ONE frame's changes, so a gap (a dropped packet with no reliable-ordered retransmission — SceneDB doesn't own transport, see above) leaves no way to reconstruct the missing state from later `Delta`s alone; a fresh `Snapshot` re-establishes a known-good baseline to resume from.
+Capture a full or filtered world state and restore it into another `World` that
+shares the same process-local component registry. This is the local primitive a
+future negotiated protocol can use for initial state or recovery; the current
+serialized snapshot is not itself safe between independently initialized
+processes. Once identities are mapped, a fresh snapshot can re-establish the
+baseline after a missing one-frame delta.
 
 ```rust
 use pulsar_scenedb::{Snapshot, RelevanceSet};
@@ -809,7 +870,7 @@ let full = Snapshot::capture_full(&world, &registry, current_frame);
 // Only entities relevant to a specific client.
 let relevant = Snapshot::capture_relevant(&world, &registry, &relevance, current_frame);
 
-// Restore into a World — e.g. a client resyncing after a connection gap.
+// Restore into a same-registry World (a future protocol must map wire IDs first).
 // Entities are (re)spawned at their exact snapshot Entity (index +
 // generation); a component the local `registry` has no registration for
 // is silently skipped, matching `Delta::apply`'s identical contract.
@@ -847,9 +908,12 @@ reconciler.reconcile(&server_delta, &mut world, |world, input| {
 > [!NOTE]
 > `Delta::apply` has no ordering guard — it unconditionally overwrites field values regardless of `delta.frame`. Applying frames out of order (an unordered/best-effort channel can deliver them that way) silently rolls state backward; track the last-applied frame yourself and skip anything not strictly newer before calling `apply`. This is deliberate — frame ordering is the transport/engine's job, not something `Delta::apply` assumes for you (see "SceneDB does NOT own transport" above).
 
-### Full integration example
+### Prototype local integration example
 
-Putting it all together in a server tick loop:
+The following shows how the local primitives compose inside one process. Its
+`Delta` output is not ready to send to independently initialized peers until
+the negotiated schema/operation protocol described in the warning above is
+implemented:
 
 ```rust
 fn server_tick(
@@ -1003,9 +1067,14 @@ let view = index.view();
 
 ### GPU-native fields on `World` entities
 
-Everything in [Macro system](#macro-system) above ties a `#[gpu]` field to `CellStorage`/`Handle` — the paged storage layer, not the archetype ECS `World` uses. That's a real gap: a component like `StaticMeshComponent { mesh: MeshHandle }` attached to a `World` entity has no path to the GPU at all through `write_gpu`, which requires a `Handle` `World` doesn't have.
-
-`World::attach_gpu_mirror` closes that gap. Once attached, `World::insert`/`insert_tracked` automatically mirrors any `#[gpu]` field of the inserted component to its registered GPU buffer at a stable component-local row — no `CellStorage`, no `Handle`, no separate mirror-aware insert call. Resolve that row with `world.gpu_row::<T>(entity)` or `GpuMirrorHandle::gpu_row::<T>(entity)`; it is deliberately not `entity.index()`:
+The derive metadata serves both SceneDB storage models. For paged cells,
+`write_gpu_columns` targets a `Handle` row. For the archetype `World`, attach a
+`GpuMirrorHandle` and register growable partners; ordinary
+`World::insert`/`insert_tracked` then publish each `#[gpu]` field at a stable
+component-local row—without a `CellStorage`, paged `Handle`, or separate
+mirror-aware insert API. Resolve that row with `world.gpu_row::<T>(entity)` or
+`GpuMirrorHandle::gpu_row::<T>(entity)`; it is deliberately not
+`entity.index()`:
 
 ```rust
 use pulsar_scenedb::{World, Entity};
@@ -1166,7 +1235,7 @@ Reallocation preserves existing bytes via a `copy_buffer_to_buffer`, and bumps `
 | Phase machine | CPU | `SimulateWitness`, `HarvestPhase`, `RetiredPhase` | Compile-time frame phase guards |
 | Assets | GPU | `GeometryArena`, `MeshRegistry`, `ClusterBuffer`, `TextureStore`, `MeshletBuffer` | GPU-side asset storage with suballocation |
 | Lease | CPU | `Lease`, `LeaseMask`, `Scratchpad` | RAII read leases, decaying per-frame scratch buffers |
-| **Replication** | CPU | `ChangeTracker`, `CpuSimulateWitness`, `Delta`, `Replicable`, `ReplicationRegistry`, `SchemaBuilder`, `RelevanceSet`, `EntityCellMap`, `AuthorityTable`, `EventBatch`, `Snapshot`, `Reconciler`, `DeltaCompressor` | Per-frame change tracking, safe generic delta encoding (`Pod` + owned/heap data via `Replicable`), interest management, ownership, condition filtering, RPC channel, world snapshots + resync, client prediction reconciliation, stateful delta compression |
+| **Replication (experimental wire contract)** | CPU | `ChangeTracker`, `CpuSimulateWitness`, `Delta`, `Replicable`, `ReplicationRegistry`, `SchemaBuilder`, `RelevanceSet`, `EntityCellMap`, `AuthorityTable`, `EventBatch`, `Snapshot`, `Reconciler`, `DeltaCompressor` | Local change/schema/codec/filter/authority/snapshot/reconciliation primitives. Raw process-local component IDs and legacy sparse operations are not a supported cross-process protocol. |
 
 ## Crates
 
@@ -1194,23 +1263,23 @@ Compile-time witnesses. `SimulateWitness`, `HarvestPhase`, and `RetiredPhase` ar
 
 **How do the replication primitives relate to the frame phase machine?**
 
-The `ChangeTracker` is populated during the Simulate phase alongside normal system execution. At the Simulate→Harvest boundary, `tracker.drain()` is called to produce a coherent `Delta` — this is the same fence that guarantees liveness-mask consistency. Relevance filtering, delta encoding, and event batching happen during or just after Harvest (read-only on storage). The reconciler runs on the client side when a server delta arrives, which is independent of the local phase machine.
+The `ChangeTracker` is populated during the Simulate phase alongside normal system execution. At the Simulate→Harvest boundary, `tracker.drain_with_world()` produces a frame-consistent structural/dirty record — this is the same fence that guarantees liveness-mask consistency. Relevance filtering and event batching can happen during or just after Harvest. Complete final-value encoding plus negotiated cross-process identity are still missing from this legacy drain path; the reconciler operates on deltas only after an engine has supplied that missing protocol layer.
 
 **Does SceneDB handle network transport?**
 
-No. SceneDB produces `Delta` (state) and `EventBatch` (RPC) byte payloads and specifies the encoding for each field via `ReplicationEncoding`. The engine is responsible for transport — TCP, UDP, WebSocket, Steam, EOS, or any other medium. SceneDB does not do encryption, authentication, connection management, NAT punch, or relay.
+No. SceneDB also does not yet provide a sound cross-process identity/operation protocol: the current `Delta`, snapshot, event, and handshake bytes contain process-local component IDs. An engine must not put those legacy bytes directly on TCP, UDP, WebSocket, Steam, EOS, or another transport. Stable schema negotiation and explicit operations must land first; encryption, authentication, connection management, NAT punch, and relay remain engine responsibilities after that.
 
 **Does SceneDB handle asset streaming?**
 
-No. A `GpuHandle`-mode field replicates only the handle index (8 bytes). The actual GPU resource (mesh, texture, buffer) is loaded independently by the engine's asset streaming system. SceneDB says "entity 42's mesh changed to handle 17 at frame 128" — the assembly and delivery of the vertex data is a separate pipeline.
+No. `GpuHandle` is currently a semantic raw-field encoding: helper codecs copy the registered field representation and do not enforce an eight-byte layout. Use an explicit, stable packed asset key (for example `u64`) and keep the actual mesh, texture, or buffer payload in the engine's asset-streaming pipeline.
 
 **Can I use SceneDB replication for a multi-user editor?**
 
-Yes. The `Ownership::Shared` mode enables optimistic concurrent writes from multiple peers. Conflicts are resolved deterministically at the frame boundary — the peer with the higher `ClientId` wins. No locks, no operational transform, no CRDT. The editor builds collaboration semantics (OT, undo history, lock server) on top of this primitive. SceneDB provides the deterministic conflict resolution; the editor provides the user-facing collaboration model.
+Not across independent processes with the current wire format. `Ownership::Shared` and deterministic conflict resolution are useful local building blocks, but an editor must first add or wait for stable schema negotiation, explicit component operations, ordering, authentication, and its own OT/CRDT/locking/undo semantics.
 
 **What is the wire format for schema handshake?**
 
-All values are little-endian. The handshake message is: `schema_count: u32`, then for each schema: `component_type: u32`, `field_count: u32`, then for each field: `field_index: u32`, `encoding: u8`, `condition: u8`, `event_channel: u8`. Encoding values: 0=Pod, 1=Serialized, 2=GpuHandle, 3=DeltaCompressed, 4=Event, 5=Opaque. Condition values: 0-10 mapping the 11 `ReplicationCondition` variants. Event channel: 0=None, 1=ReliableOrdered, 2=Unreliable.
+The legacy descriptor format is little-endian: `schema_count: u32`, then for each schema: `component_type: u32`, `field_count: u32`, then for each field: `field_index: u32`, `encoding: u8`, `condition: u8`, `event_channel: u8`. Encoding values are 0=Pod, 1=Serialized, 2=GpuHandle, 3=DeltaCompressed, 4=Event, 5=Opaque; conditions are 0-10; event channel is 0=None, 1=ReliableOrdered, 2=Unreliable. Crucially, `component_type` is only a process-local `ComponentId`, field names/versions are absent, and `from_handshake` creates no local codec binding. Treat this as a legacy schema-inspection format, not negotiation.
 
 ## License
 

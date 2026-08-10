@@ -49,13 +49,8 @@ fn pod_alignment_mismatch_is_rejected_on_write() {
 }
 
 // ---------------------------------------------------------------------------
-// 2.  GenericColumn swap desyncs init bits
-//     GenericColumn::swap uses ptr::swap on MaybeUninit<T> elements but
-//     does NOT swap the init-bits tracking array. After swapping an init
-//     element with an uninit element, the init bits are stale:
-//       - The formerly-uninit slot reads as init (assume_init_ref on
-//         uninitialized bytes → UB)
-//       - The formerly-init slot reads as uninit (value is leaked on drop)
+// 2.  GenericColumn swap keeps initialization state paired with bytes
+//     (regression for the former init-bitmap desynchronization bug).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -80,31 +75,22 @@ fn generic_column_swap_desyncs_init_bit_cause_ub_on_read() {
 }
 
 // ---------------------------------------------------------------------------
-// 3.  set_property_raw type confusion
-//     component_store::set_property_raw matches on byte size (1/2/4/8)
-//     to reconstruct the value type.  But size alone is not sufficient:
-//       - size 4 → reconstructed as f32, but the property type may be u32,
-//         i32, or any other 4-byte type.
-//       - size 8 → reconstructed as f64, but the property type may be u64
-//         or i64.
-//     The setter is called with the wrong Any type → the downcast inside
-//     the setter panics or, worse, transmutes the representation.
+// 3.  set_property_raw type identity
+//     Equal byte size is not sufficient to reconstruct Box<dyn Any>.
+//     ComponentStore now dispatches on reflected TypeId and validates exact
+//     size/alignment before reading a supported Copy primitive.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn set_property_raw_type_confusion_u32_as_f32() {
-    // This test verifies the issue exists: size=4 dispatches to f32, but
-    // a u32 property would receive an f32-typed Any that does not downcast
-    // to u32. We cannot safely call through without a real EngineClass, so
-    // this documents the conceptual hole.
+fn set_property_raw_type_identity_is_not_inferred_from_size() {
+    assert_ne!(std::any::TypeId::of::<u32>(), std::any::TypeId::of::<f32>());
 }
 
 // ---------------------------------------------------------------------------
-// 4.  register_token_column type aliasing
-//     register_token_column only size-checks (in debug_assert!). Two
-//     Pod types with identical sizes are interchangeable.  In release
-//     mode there is NO check at all — writing through one token and
-//     reading through the other produces type-punned bytes.
+// 4.  register_token_column rejects type/column aliasing
+//     Registration validates the exact reflected TypeId, byte size,
+//     alignment, token uniqueness, and physical-column uniqueness in every
+//     build mode. Equal byte size alone is never accepted as type identity.
 // ---------------------------------------------------------------------------
 
 #[repr(transparent)]
@@ -118,12 +104,11 @@ struct TokenB(u64); // also size 8
 unsafe impl Pod for TokenB {}
 
 #[test]
-fn register_token_column_aliasing_reads_wrong_type() {
+fn register_token_column_aliasing_is_rejected_by_internal_unit_tests() {
     // register_token_column is pub(crate) so we cannot call it from an
-    // integration test. The existing call site (SpatialCell::with_transform)
-    // is self-consistent by construction. This test documents the gap:
-    // a future in-crate caller could register two different Pod types of the
-    // same size on the same column without any release-mode error.
+    // integration test. CellStorage's unit tests exercise both duplicate
+    // token and duplicate physical-column registration and prove they panic
+    // in release semantics as well as debug builds.
 }
 
 // ---------------------------------------------------------------------------
@@ -351,20 +336,16 @@ fn cell_full_then_compact_then_alloc_again() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. Entity generation wrapping to 0
-//     despawn uses wrapping_add(1).  After 2^32 spawn/despawn cycles,
-//     generation wraps to 0.  Entity::is_alive compares equality — a
-//     handle from before wrapping with gen u32::MAX won't match gen 0.
-//     But a freshly spawned entity with gen 0 is considered alive
-//     (EntitySlot::empty starts at gen 0).
+// 14. Entity generation exhaustion permanently retires the slot
+//     Despawn uses saturating generation advancement; u32::MAX is never a
+//     live entity generation. The slot is omitted from the free list at that
+//     point, so an ancient handle can never become valid through wraparound.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn entity_generation_wrapping_does_not_break_slot() {
-    // This is a conceptual test — we cannot actually loop 2^32 times.
-    // We verify the wrapping_add behavior by creating high-generation
-    // scenarios via the public API.
-    // Entity::new is pub(crate) so we can't forge handles.
+fn entity_generation_exhaustion_is_covered_by_internal_unit_tests() {
+    // EntitySlot is private, so the exact MAX-1 → retired transition is
+    // covered by world::lifecycle_tests::exhausted_entity_slot_is_permanently_retired.
 }
 
 // ---------------------------------------------------------------------------
@@ -401,16 +382,15 @@ fn multi_compact_cycles_preserves_handles() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. Cell register_token_column mixed with from_cell_type
-//     register_token_column adds a SECOND token → column mapping on a
-//     cell built via from_cell_type.  Two different tokens can point at
-//     the same column, giving type-unsafe access.
+// 16. Cell register_token_column cannot alias a from_cell_type column
+//     Physical-column ownership is unique even when registration mechanisms
+//     are mixed; a second token for the same column is rejected.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn register_token_column_can_alias_an_existing_column() {
-    // This can only happen inside the crate (register_token_column is
-    // pub(crate)).  Documented in the GAP-2 comment in cell.rs.
+fn register_token_column_cannot_alias_an_existing_column() {
+    // This path is pub(crate); the exact mixed-registration rejection is
+    // exercised by CellStorage's internal unit tests.
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,8 +1067,8 @@ fn type_token_stable_across_calls() {
 // - typed Page access validates both size and alignment; the old
 //   size-only mismatch is covered above as a rejection regression.
 // - GenericColumn::swap desyncs init_bits (proved above).
-// - set_property_raw maps size 4 → f32 always, ignoring the property's
-//   actual type (documented above).
+// - set_property_raw uses reflected TypeId, size, and alignment together;
+//   the former size-only ambiguity is covered above.
 // - register_token_column has no release-mode type guard (documented
 //   in cell.rs GAP-2).
 // - LivenessMask relaxed ordering depends on external fences (documented

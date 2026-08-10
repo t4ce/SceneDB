@@ -34,7 +34,7 @@ pub fn generate_gpu_column_set(
                 pub fn register_gpu_columns(
                     _store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
                     _capacity: u32,
-                    _device: &::wgpu::Device,
+                    _device: &::pulsar_scenedb::wgpu::Device,
                 ) {
                 }
 
@@ -42,7 +42,7 @@ pub fn generate_gpu_column_set(
                 pub fn register_gpu_columns_growable(
                     _store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
                     _initial_capacity: u32,
-                    _device: &::std::sync::Arc<::wgpu::Device>,
+                    _device: &::std::sync::Arc<::pulsar_scenedb::wgpu::Device>,
                 ) {
                 }
             }
@@ -350,6 +350,7 @@ pub fn generate_gpu_column_set(
             ::pulsar_scenedb::bytemuck::Zeroable,
             ::pulsar_scenedb::bytemuck::Pod,
         )]
+        #[bytemuck(crate = "::pulsar_scenedb::bytemuck")]
         pub struct #packed_view_ident {
             #(#packed_field_defs),*
         }
@@ -661,7 +662,7 @@ pub fn generate_gpu_column_set(
             pub fn register_gpu_columns(
                 store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
                 capacity: u32,
-                device: &::wgpu::Device,
+                device: &::pulsar_scenedb::wgpu::Device,
             ) {
                 store.register_gpu_column_descs(
                     <Self as ::pulsar_scenedb::GpuColumnSet>::gpu_columns()
@@ -689,7 +690,21 @@ pub fn generate_gpu_column_set(
             pub fn register_gpu_columns_growable(
                 store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
                 initial_capacity: u32,
-                device: &::std::sync::Arc<::wgpu::Device>,
+                device: &::std::sync::Arc<::pulsar_scenedb::wgpu::Device>,
+            ) {
+                <Self as ::pulsar_scenedb::GrowableGpuColumnSet>::register_gpu_columns_growable(
+                    store,
+                    initial_capacity,
+                    device,
+                );
+            }
+        }
+
+        unsafe impl #impl_generics ::pulsar_scenedb::GrowableGpuColumnSet for #name #ty_generics #where_clause {
+            fn register_gpu_columns_growable(
+                store: &mut ::pulsar_scenedb::gpu::SceneGpuStore,
+                initial_capacity: u32,
+                device: &::std::sync::Arc<::pulsar_scenedb::wgpu::Device>,
             ) {
                 #register_growable_descs
                 let owner_component_id =

@@ -11,11 +11,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use serde::Serialize;
 
 use crate::cell::CellStorage;
-use crate::cell_type::RegisteredCellType;
-use crate::component::ComponentId;
-use crate::gpu::{CellId, GpuBufferDispatch, SceneGpuStore};
-use crate::page::Pod;
-use crate::token::TypeToken;
+use crate::gpu::{CellId, SceneGpuStore};
 
 // ── Telemetry data types ──────────────────────────────────────────────────
 
@@ -113,7 +109,7 @@ pub struct PoolInfo {
 }
 
 // ── Query log ─────────────────────────────────────────────────────────────
-// Lock-free ring buffer for tracking recent spatial queries.
+// Bounded, preallocated ring buffer for tracking recent spatial queries.
 // Enabled only when `telemetry` feature is active; zero-cost when disabled.
 
 #[derive(Clone, Serialize)]
@@ -135,20 +131,113 @@ pub struct FrequentQuery {
     pub avg_duration_ns: u64,
 }
 
+#[derive(Clone, Copy)]
+struct InlineText<const N: usize> {
+    bytes: [u8; N],
+    len: u16,
+}
+
+impl<const N: usize> InlineText<N> {
+    fn new() -> Self {
+        assert!(N <= u16::MAX as usize);
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        let mut text = Self::new();
+        std::fmt::Write::write_str(&mut text, value)
+            .expect("InlineText writes are infallible");
+        text
+    }
+
+    fn from_args(args: std::fmt::Arguments<'_>) -> Self {
+        let mut text = Self::new();
+        // `write_str` truncates at a UTF-8 boundary instead of allocating.
+        let _ = std::fmt::write(&mut text, args);
+        text
+    }
+
+    fn as_str(&self) -> &str {
+        // Every byte entered through `fmt::Write::write_str`, which copies only
+        // complete UTF-8 prefixes.
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[..self.len as usize]) }
+    }
+}
+
+impl<const N: usize> std::fmt::Write for InlineText<N> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let start = self.len as usize;
+        let remaining = N.saturating_sub(start);
+        let mut count = value.len().min(remaining);
+        while !value.is_char_boundary(count) {
+            count -= 1;
+        }
+        self.bytes[start..start + count].copy_from_slice(&value.as_bytes()[..count]);
+        self.len += count as u16;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawQueryLogEntry {
+    timestamp_ms: u64,
+    query_type: InlineText<16>,
+    cell_id: u32,
+    duration_ns: u64,
+    rows_returned: u32,
+    total_rows: u32,
+    args: InlineText<128>,
+}
+
+impl RawQueryLogEntry {
+    fn from_public(entry: QueryLogEntry) -> Self {
+        Self {
+            timestamp_ms: entry.timestamp_ms,
+            query_type: InlineText::from_str(&entry.query_type),
+            cell_id: entry.cell_id,
+            duration_ns: entry.duration_ns,
+            rows_returned: entry.rows_returned,
+            total_rows: entry.total_rows,
+            args: InlineText::from_str(&entry.args),
+        }
+    }
+
+    fn to_public(self) -> QueryLogEntry {
+        QueryLogEntry {
+            timestamp_ms: self.timestamp_ms,
+            query_type: self.query_type.as_str().to_owned(),
+            cell_id: self.cell_id,
+            duration_ns: self.duration_ns,
+            rows_returned: self.rows_returned,
+            total_rows: self.total_rows,
+            args: self.args.as_str().to_owned(),
+        }
+    }
+}
+
 pub struct QueryLog {
-    entries: Mutex<VecDeque<QueryLogEntry>>,
+    entries: Mutex<VecDeque<RawQueryLogEntry>>,
     max_entries: usize,
 }
 
 impl QueryLog {
-    pub const fn new(max_entries: usize) -> Self {
+    pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: Mutex::new(VecDeque::new()),
+            // Telemetry is opt-in. Paying its bounded allocation once keeps
+            // the measured spatial-query hot path allocation-free afterward.
+            entries: Mutex::new(VecDeque::with_capacity(max_entries)),
             max_entries,
         }
     }
 
     pub fn log(&self, entry: QueryLogEntry) {
+        self.log_raw(RawQueryLogEntry::from_public(entry));
+    }
+
+    fn log_raw(&self, entry: RawQueryLogEntry) {
         if let Ok(mut entries) = self.entries.lock() {
             entries.push_back(entry);
             while entries.len() > self.max_entries {
@@ -164,7 +253,8 @@ impl QueryLog {
             .iter()
             .rev()
             .take(n)
-            .cloned()
+            .copied()
+            .map(RawQueryLogEntry::to_public)
             .collect()
     }
 
@@ -203,22 +293,78 @@ pub static SLOW_QUERY_LOG: LazyLock<QueryLog> = LazyLock::new(|| QueryLog::new(5
 pub const SLOW_QUERY_THRESHOLD_NS: u64 = 200_000;
 
 pub fn log_query(query_type: &str, cell_id: u32, duration_ns: u64, rows_returned: u32, total_rows: u32, args: &str) {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let entry = QueryLogEntry {
-        timestamp_ms,
-        query_type: query_type.to_string(),
+    log_query_args(
+        query_type,
         cell_id,
         duration_ns,
         rows_returned,
         total_rows,
-        args: args.to_string(),
+        format_args!("{args}"),
+    );
+}
+
+pub(crate) fn log_query_args(
+    query_type: &str,
+    cell_id: u32,
+    duration_ns: u64,
+    rows_returned: u32,
+    total_rows: u32,
+    args: std::fmt::Arguments<'_>,
+) {
+    // Initialize and preallocate both rings during the caller's warm-up. A
+    // query crossing the slow threshold later must not pay a surprise first-
+    // use allocation inside an otherwise allocation-free hot path.
+    let query_log = &*QUERY_LOG;
+    let slow_query_log = &*SLOW_QUERY_LOG;
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let entry = RawQueryLogEntry {
+        timestamp_ms,
+        query_type: InlineText::from_str(query_type),
+        cell_id,
+        duration_ns,
+        rows_returned,
+        total_rows,
+        args: InlineText::from_args(args),
     };
-    QUERY_LOG.log(entry.clone());
+    query_log.log_raw(entry);
     if duration_ns > SLOW_QUERY_THRESHOLD_NS {
-        SLOW_QUERY_LOG.log(entry);
+        slow_query_log.log_raw(entry);
+    }
+}
+
+#[cfg(test)]
+mod query_log_tests {
+    use super::{InlineText, QueryLog, QueryLogEntry};
+
+    #[test]
+    fn bounded_raw_ring_preserves_the_public_string_contract() {
+        let log = QueryLog::new(2);
+        for index in 0..3 {
+            log.log(QueryLogEntry {
+                timestamp_ms: index,
+                query_type: "AABB".to_owned(),
+                cell_id: index as u32,
+                duration_ns: index + 10,
+                rows_returned: index as u32,
+                total_rows: 9,
+                args: format!("query-{index}"),
+            });
+        }
+
+        let recent = log.recent(3);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].args, "query-2");
+        assert_eq!(recent[1].args, "query-1");
+        assert_eq!(recent[0].query_type, "AABB");
+    }
+
+    #[test]
+    fn inline_text_truncates_only_at_utf8_boundaries() {
+        let text = InlineText::<5>::from_str("ééé");
+        assert_eq!(text.as_str(), "éé");
     }
 }
 

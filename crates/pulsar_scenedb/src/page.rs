@@ -113,11 +113,16 @@ impl<T: 'static> GenericColumn<T> {
             unsafe { self.data[idx].assume_init_drop(); }
             self.data[idx] = MaybeUninit::new(value);
         } else {
-            // Extend vec if necessary (shouldn't happen in normal use — rows
-            // are pushed before being written).
+            // Extend both the element storage and its initialization bitmap.
+            // SceneDB's page path pushes rows first, but GenericColumn is a
+            // public standalone type and `set(idx, ..)` promises to grow to
+            // `idx`. Previously it extended only `data`; `set_init` then
+            // indexed past `init_bits`, and unwinding through Drop could
+            // panic a second time while consulting the same undersized map.
             while self.data.len() <= idx {
                 self.data.push(MaybeUninit::uninit());
             }
+            self.init_bits.resize(self.data.len().div_ceil(64), 0);
             self.data[idx] = MaybeUninit::new(value);
         }
         self.set_init(idx);
@@ -255,6 +260,7 @@ pub enum LayoutError {
     StrideExceeded { stride: u32 },
     BadCapacity { capacity: u32 },
     AlignmentExceeded { align: u32 },
+    InvalidColumnLayout { size: u32, align: u32 },
 }
 
 /// Computed byte layout for a page: per-column offsets within one contiguous
@@ -272,13 +278,29 @@ impl PageLayout {
         if capacity == 0 || capacity > MAX_PAGE_CAPACITY {
             return Err(LayoutError::BadCapacity { capacity });
         }
-        let stride: u32 = columns.iter().map(|c| c.size).sum();
-        if stride > MAX_STRIDE_BYTES {
-            return Err(LayoutError::StrideExceeded { stride });
+        let stride = columns
+            .iter()
+            .try_fold(0u64, |total, column| {
+                total.checked_add(u64::from(column.size))
+            })
+            .unwrap_or(u64::MAX);
+        if stride > u64::from(MAX_STRIDE_BYTES) {
+            return Err(LayoutError::StrideExceeded {
+                stride: u32::try_from(stride).unwrap_or(u32::MAX),
+            });
         }
         let mut offsets = Vec::with_capacity(columns.len());
         let mut cursor = 0usize;
         for col in columns {
+            if col.align == 0
+                || !col.align.is_power_of_two()
+                || col.size % col.align != 0
+            {
+                return Err(LayoutError::InvalidColumnLayout {
+                    size: col.size,
+                    align: col.align,
+                });
+            }
             if col.align as usize > COLUMN_ALIGN {
                 return Err(LayoutError::AlignmentExceeded { align: col.align });
             }
@@ -390,7 +412,10 @@ impl Page {
     /// Drop the last row (used by swap-and-pop compaction).
     /// Also drops the trailing element of every generic column.
     pub fn pop_row(&mut self) {
-        debug_assert!(self.len > 0);
+        // This is a public safe API. Allowing an empty pop to wrap `len` to
+        // u32::MAX in release mode would let later typed access construct a
+        // slice whose logical row count no longer describes the allocation.
+        assert!(self.len > 0, "cannot pop a row from an empty Page");
         self.len -= 1;
         for gc in &mut self.generic_columns {
             gc.pop_row();
@@ -560,6 +585,39 @@ mod tests {
             PageLayout::new(&cols, 256),
             Err(LayoutError::StrideExceeded { stride: 136 })
         ));
+
+        let hostile = [
+            ColumnDesc {
+                size: u32::MAX,
+                align: 1,
+            },
+            ColumnDesc {
+                size: u32::MAX,
+                align: 1,
+            },
+        ];
+        assert!(matches!(
+            PageLayout::new(&hostile, 1),
+            Err(LayoutError::StrideExceeded { stride: u32::MAX })
+        ));
+    }
+
+    #[test]
+    fn malformed_raw_column_descriptors_are_rejected() {
+        for desc in [
+            ColumnDesc { size: 4, align: 0 },
+            ColumnDesc { size: 4, align: 3 },
+            ColumnDesc { size: 3, align: 2 },
+        ] {
+            let error = PageLayout::new(&[desc], 16).unwrap_err();
+            assert_eq!(
+                error,
+                LayoutError::InvalidColumnLayout {
+                    size: desc.size,
+                    align: desc.align,
+                }
+            );
+        }
     }
 
     #[test]
@@ -614,6 +672,25 @@ mod tests {
         let layout = PageLayout::new(&[ColumnDesc::of::<u32>()], 16).unwrap();
         let page = Page::new(&layout);
         let _ = page.column_raw_bytes(0, 17);
+    }
+
+    #[test]
+    fn generic_column_out_of_range_set_grows_init_bitmap_too() {
+        let mut column = GenericColumn::<String>::new(1);
+        column.set(130, "expanded".to_owned());
+        assert_eq!(column.len(), 131);
+        assert_eq!(column.get(130).map(String::as_str), Some("expanded"));
+        assert!(column.get(129).is_none());
+        // Dropping the expanded column also walks the enlarged bitmap; this
+        // used to panic after `set` had already panicked out of bounds.
+        drop(column);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot pop a row from an empty Page")]
+    fn empty_page_pop_is_rejected_in_all_build_modes() {
+        let mut page = Page::new(&two_column_layout());
+        page.pop_row();
     }
 
     #[test]
