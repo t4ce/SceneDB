@@ -735,7 +735,7 @@ fn bench_archetype_pressure(p: &mut Profiler, n: usize, components_per_entity: u
         }
     }
 
-    let archetypes = world.archetypes.len();
+    let archetypes = world.archetype_count();
     println!("  Archetypes created: {}", archetypes);
 
     // Query across all archetypes.

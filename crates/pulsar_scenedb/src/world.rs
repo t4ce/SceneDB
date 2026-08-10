@@ -23,10 +23,10 @@ use ahash::AHashMap;
 /// Queries scan all archetypes, using the `u64` bitmask to skip non-matching
 /// archetypes in constant time.
 pub struct World {
-    pub entity_slots: Vec<EntitySlot>,
-    pub free_slots: Vec<u32>,
-    pub archetypes: Vec<Archetype>,
-    pub archetype_index: AHashMap<ArchetypeKey, ArchetypeId>,
+    pub(crate) entity_slots: Vec<EntitySlot>,
+    pub(crate) free_slots: Vec<u32>,
+    pub(crate) archetypes: Vec<Archetype>,
+    pub(crate) archetype_index: AHashMap<ArchetypeKey, ArchetypeId>,
     /// GPU-mirror wiring for `#[gpu]`-tagged component fields (see
     /// `crate::gpu::world_mirror`). `None` (the default) means `insert`
     /// behaves exactly as it does without the `gpu` feature at all — this
@@ -247,6 +247,24 @@ impl World {
                 }
             }
         }
+    }
+
+    /// Number of archetype layouts currently allocated, including the empty
+    /// archetype and layouts whose last entity has been removed.
+    #[inline]
+    pub fn archetype_count(&self) -> usize {
+        self.archetypes.len()
+    }
+
+    /// Number of archetype layouts that currently contain at least one
+    /// entity. Internal archetype vectors remain sealed so external safe code
+    /// cannot invalidate the storage invariants used by queries.
+    #[inline]
+    pub fn non_empty_archetype_count(&self) -> usize {
+        self.archetypes
+            .iter()
+            .filter(|archetype| !archetype.is_empty())
+            .count()
     }
 
     // â”€â”€ Entity lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -735,7 +753,37 @@ impl World {
         })
     }
 
-    /// Returns a mutable reference to component `T` on `entity`, if present.
+    /// Copy-edit-replace a component through the normal insertion path.
+    ///
+    /// This is the mutation API for GPU-partnered components: replacing the
+    /// value lets generated mirror dispatch compare the old and new fields
+    /// and publish only the changed GPU rows. The edit is transactional with
+    /// respect to panics because the authoritative stored value is not
+    /// replaced until `edit` returns.
+    ///
+    /// `#[gpu(mirror = Once)]` fields retain their one-time-handoff semantics
+    /// on replacement. Such fields are not suitable for authored mutation;
+    /// remove and reinsert the component to begin a new presence lifetime.
+    pub fn edit<T: Component + Copy, R>(
+        &mut self,
+        entity: Entity,
+        edit: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        let mut value = *self.get::<T>(entity)?;
+        let result = edit(&mut value);
+        self.insert(entity, value);
+        Some(result)
+    }
+
+    /// Returns a mutable reference to CPU-only component `T` on `entity`, if
+    /// present.
+    ///
+    /// # Panics
+    ///
+    /// When a GPU mirror is attached, this rejects component types with
+    /// `#[gpu]` fields. A raw mutable reference cannot trigger generated
+    /// field-level dirty dispatch; use [`Self::edit`] or [`Self::insert`]
+    /// instead.
     #[inline]
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
         if !self.is_alive(entity) {
@@ -746,6 +794,15 @@ impl World {
             (s.archetype, s.row as usize)
         };
         let cid = crate::component::component_id::<T>();
+
+        #[cfg(feature = "gpu")]
+        assert!(
+            self.gpu_mirror.is_none()
+                || crate::gpu::world_mirror::dispatch_for(cid).is_none(),
+            "get_mut cannot borrow GPU-mirrored component {:?} mutably; use World::edit or World::insert so mirror dirty dispatch runs",
+            cid,
+        );
+
         Self::get_erased_mut(&mut self.archetypes[arch_id.0 as usize], cid).and_then(|c| {
             c.as_any_mut()
                 .downcast_mut::<Column<T>>()

@@ -128,11 +128,10 @@ pub use page::{
 // Generated GPU row wrappers use bytemuck's stronger no-uninitialized-byte
 // Pod contract. Re-export it so downstream macro expansions do not need a
 // direct dependency merely to name the derive traits.
-#[cfg(feature = "gpu")]
 #[doc(hidden)]
 pub use bytemuck;
 pub use pulsar_reflection;
-pub use query::{QueryIter, WorldQuery};
+pub use query::{QueryIter, QueryIterMut, WorldQuery, WorldQueryMut};
 pub use registry::{HandleRegistry, NULL_ROW};
 pub use relation::{ConflictEntry, ConflictReason, RelationIndex, RelationView};
 pub use replication::{

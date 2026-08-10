@@ -77,8 +77,8 @@ impl ArchetypeKey {
 /// and the entity vec.  Entity removal uses `swap_remove` â€” the last entity
 /// is moved into the vacated slot and its row is updated in the slot map.
 pub struct Archetype {
-    pub id: ArchetypeId,
-    pub key: ArchetypeKey,
+    pub(crate) id: ArchetypeId,
+    pub(crate) key: ArchetypeKey,
     /// Pre-computed, immutable list of this archetype's component IDs.
     /// Populated once in [`Archetype::new`] and never modified.  Used by
     /// the migration routines to iterate columns without heap-allocating
@@ -87,12 +87,12 @@ pub struct Archetype {
     /// Columns indexed by `ComponentId.0 as usize`.  A `None` slot means the
     /// archetype does not contain that component type.  Dense indexing avoids
     /// hashing overhead on the query path.
-    pub columns: Vec<Option<Box<dyn ErasedColumn>>>,
-    pub entities: Vec<Entity>,
+    pub(crate) columns: Vec<Option<Box<dyn ErasedColumn>>>,
+    pub(crate) entities: Vec<Entity>,
     /// Bitmask over the first 64 component IDs for fast archetype
     /// filtering during queries.  Bit `i` is set if component ID `i+1`
     /// is present.
-    pub mask: u64,
+    pub(crate) mask: u64,
 }
 
 impl Archetype {

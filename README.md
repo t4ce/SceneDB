@@ -160,11 +160,13 @@ grid.unpin(CellCoord { x: 5, z: 3 });
 
 ## Macro system
 
-SceneDB provides a suite of derive macros that generate Pod implementations, GPU column dispatch, and replication schema declarations — turning plain structs into fully wired engine components with zero boilerplate.
+SceneDB provides derive macros that generate field-column metadata, GPU partner dispatch, and replication schema declarations. The component itself remains an ordinary Rust struct; only fields that actually cross a raw-byte storage boundary must satisfy that boundary's byte-layout contract.
 
-### `#[derive(SceneStore)]` — Pod + GPU dispatch + storage location
+### `#[derive(SceneStore)]` — field columns + GPU dispatch + storage location
 
-The workhorse macro defined in `pulsar_scenedb_derive`. Generates a `Pod` impl, `SceneColumnSet` (column layout), `GpuColumnSet` (GPU write dispatch), and `MirrorMode` wiring. Every field must itself implement SceneDB's narrow `Pod` trait, and the resulting type must be `Copy`. A field marked `#[gpu]` additionally must implement bytemuck's `Pod + Zeroable`: differential World dispatch compares the exact shader-row bytes, so implicit/uninitialized padding is rejected at compile time rather than spuriously dirtying a row or invoking undefined behavior. Packed layouts also assert that the generated row size equals the sum of its fields; represent shader padding with explicit `#[gpu]` padding fields. The built-in fixed-size array implementation is `[f32; 16]`; `[f32; 2/3/4]`, `[u8; N]`, and arbitrary arrays are not SceneDB `Pod` merely because their elements are. Use scalar fields, `[f32; 16]`, or a reviewed local newtype with an explicit `unsafe impl Pod` whose all-zero representation is valid. `repr(C)` is strongly recommended for any type whose bytes cross an FFI/GPU boundary; the derive does not prove an arbitrary CPU-only struct has no padding.
+The workhorse macro defined in `pulsar_scenedb_derive`. It generates `SceneColumnSet` field layout and, when GPU fields are present, an unsafe `GpuColumnSet` dispatch plus `MirrorMode` wiring. It deliberately does **not** implement `Pod` for the whole component: ordinary inter-field padding and CPU-only metadata are never read as one raw record.
+
+Fields used by the paged `CellStorage` path must implement SceneDB's `Pod` trait. `Pod` now extends bytemuck's `Pod`, so it means Copy, zero-valid, and no implicit or uninitialized padding—not merely “Copy.” A field marked `#[gpu]` must likewise implement bytemuck `Pod + Zeroable`; differential World dispatch compares the exact shader-row bytes. Packed layouts additionally assert that the generated row size equals the sum of its fields, so shader padding must be represented by explicit fields. SceneDB directly implements its own `Pod` only for scalar primitives and `[f32; 16]`; use a reviewed local newtype deriving bytemuck `Pod + Zeroable`, then explicitly implement SceneDB `Pod`, for other raw CPU column shapes. CPU-rich component structs themselves need neither `Pod` nor `Copy` unless another API separately requires it.
 
 ```rust
 use pulsar_scenedb_derive::SceneStore;
@@ -178,9 +180,8 @@ pub struct Transform {
 
 This expands to:
 
-- `unsafe impl Pod for Transform` — enables direct column memcpy
 - `impl SceneColumnSet for Transform` — column descriptors for `CellType`
-- `impl GpuColumnSet for Transform` — GPU column descriptors + `write_gpu` dispatch
+- for GPU-bearing types only, unique padding-free field wrappers plus `unsafe impl GpuColumnSet for Transform` — GPU descriptors and write dispatch
 
 #### Per-field storage location with `#[gpu(mirror = ...)]`
 
@@ -302,7 +303,7 @@ pub struct StaticMeshInstance {
 
 #### Packed layout with `#[gpu(layout = packed)]`
 
-By default every `#[gpu]` field gets its own buffer — the right shape for genuinely independent fields (two components' unrelated `f32`s never share storage just because they're the same size). Some structs are the opposite case: a renderer's per-instance GPU record, where every `#[gpu]` field is always read together, by one shader, as one interleaved struct — exactly the shape of Helio's `GpuInstanceData` (model matrix, normal matrix, bounds, previous-frame matrix, mesh/material ids, flags — always bound and read as a single 208-byte record, never independently). Splitting that into 8 separate buffers has no benefit and forces a shader rewrite for no reason. `#[gpu(layout = packed)]` on the struct groups every `#[gpu]` field into one buffer instead:
+By default every `#[gpu]` field gets its own buffer—the right shape for fields with different update frequencies or consumers. Some authored shader records are always read and updated together; `#[gpu(layout = packed)]` groups those GPU fields into one interleaved buffer. Do not use packing to make render-derived state (temporal history, compact draw slots, visibility, atlas assignments, or indirect commands) canonical: those values still belong to the renderer/pass that produces them.
 
 ```rust
 #[derive(SceneStore, Clone, Copy)]
@@ -364,8 +365,8 @@ use pulsar_scenedb::ReplicationEncoding::*;
 use pulsar_scenedb::ReplicationCondition::*;
 
 /// A mesh instance that is both GPU-native AND replicated over the network.
-/// SceneStore generates Pod + GPU dispatch for the #[gpu] fields; Replicate
-/// generates `register_replication` from the #[replicate] fields. `Default`
+/// SceneStore generates column metadata + GPU dispatch for the #[gpu]
+/// fields; Replicate generates `register_replication` from #[replicate]. `Default`
 /// is required by `Replicate` — it's how a freshly-spawned entity gets a
 /// placeholder row before its real field values arrive over the wire.
 #[derive(SceneStore, Replicate, Default)]
@@ -454,7 +455,8 @@ use pulsar_scenedb_derive::{SceneStore, Replicate};
 use pulsar_scenedb::ReplicationEncoding::*;
 use pulsar_scenedb::ReplicationCondition::*;
 
-/// A fully wired engine component: SceneStore generates Pod + GPU dispatch,
+/// A fully wired engine component: SceneStore generates column metadata and
+/// GPU dispatch,
 /// Replicate generates the replication schema for the delta encoder.
 #[derive(SceneStore, Replicate, Default)]
 #[repr(C)]
@@ -486,8 +488,8 @@ struct Character {
 
 At compile time, `#[derive(SceneStore)]` expands to:
 
-- `unsafe impl Pod for Character` — enables direct memcpy of column data
-- `impl GpuColumnSet for Character` — column descriptors and GPU write dispatch
+- `impl SceneColumnSet for Character` — per-field CPU column metadata
+- for GPU-bearing concrete types, `unsafe impl GpuColumnSet for Character` — padding-free field descriptors and GPU write dispatch
 - `const COLUMN_DESCS: &[ColumnDesc]` — column layout for `CellStorage::new`
 - `fn write_gpu_columns(&self, store: &SceneGpuStore, handle: Handle, witness: &SimulateWitness)` — per-field GPU mirror writes
 
@@ -591,7 +593,7 @@ use pulsar_scenedb::{ReplicationRegistry, ReplicationEncoding, ReplicationCondit
 
 // `register::<T>()` requires `T: Component + Default` — `Default` fills a
 // placeholder row when an entity is spawned before its real values arrive.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Transform {
     matrix: [[f32; 4]; 4],
 }
@@ -605,10 +607,12 @@ impl Component for Health {}
 
 let mut registry = ReplicationRegistry::new();
 
-// `[[f32; 4]; 4]` isn't `Pod` in this crate (the built-in fixed-size array
-// implementation is `[f32; 16]`) — for a hand-registered type like this, either
-// mark it `unsafe impl Pod for Transform {}` yourself if it's safe to
-// byte-reinterpret, or implement `Replicable` directly.
+// `[[f32; 4]; 4]` is not directly a SceneDB Pod column type. For a
+// hand-registered whole value, first prove the representation through
+// bytemuck, then opt into SceneDB's raw-column contract—or implement
+// `Replicable` directly.
+unsafe impl pulsar_scenedb::bytemuck::Zeroable for Transform {}
+unsafe impl pulsar_scenedb::bytemuck::Pod for Transform {}
 unsafe impl pulsar_scenedb::Pod for Transform {}
 
 let builder = registry.register::<Transform>();
@@ -1107,7 +1111,7 @@ Growth also now respects the device's own `wgpu::Limits::max_buffer_size` (256 M
 
 **Scattered writes (SceneDB#39).** The scan above still coalesces dirty rows into contiguous runs and uploads each run with its own `queue.write_buffer` call — fine when dirty rows cluster, but real churn can dirty rows scattered across a component's stable local allocation domain, where coalescing produces close to one run per row. Measured at 100k entities/10% churn per frame before component-local rows landed, despawn and insert together cost under 1% of the frame while `flush_gpu_mirror` took ~28 ms/frame from roughly 20,000 individual writes across the instance and generation columns. Above `DirtyTrackedSceneBuffer::SCATTER_RUN_THRESHOLD` (4) contiguous runs, `flush` switches to a GPU-side scatter-write compute pass: every dirty row's index and value are packed into two flat host-side arrays and uploaded in exactly two `queue.write_buffer` calls total, then one compute dispatch scatters each value to its destination row. One pipeline serves every column's element type/size. Below the threshold, direct per-run writes still win because scatter's fixed uploads and dispatch are not paid back by skipping only a couple of calls. In that benchmark, scatter reduced mirror flush from ~28 ms to ~1.4 ms and total frame time from ~44 ms to ~8 ms; component-local allocation additionally removes unrelated component populations from each value buffer's row span.
 
-**Concurrency.** `#[gpu]` (`DirtyTracked`) fields' `mark_dirty` no longer takes an exclusive lock for every mark — the common case (a row that already fits) only needs a shared read lock, so threads marking *disjoint* rows proceed concurrently instead of serializing against each other for no structural reason. One real caveat worth knowing: never call `insert()`/the underlying `mark_dirty` for the *same* row from two threads at once — every real caller already satisfies this naturally (a row is one entity, and `World::insert`'s own `&mut self` signature prevents two threads inserting onto the same entity concurrently one layer up), but it's a genuine precondition, not just an implementation detail. A benchmark pass (Helio#211) found that `GrowableSceneBuffer`'s write path — which already used this same read-lock-first shape — *still* showed per-write cost increasing with thread count, pointing at `wgpu::Queue`'s own internal submission synchronization as a real, separate contributor that no amount of restructuring this crate's own locks removes.
+**Concurrency.** `#[gpu]` (`DirtyTracked`) fields' `mark_dirty` no longer takes an exclusive structural lock for every mark: rows that already fit use a shared outer lock, so disjoint rows proceed concurrently. Same-row writes are serialized by row-striped locks and have explicit last-writer-wins semantics; safe callers can no longer race the backing `UnsafeCell` into a torn value. A benchmark pass (Helio#211) found that `GrowableSceneBuffer`'s write path still showed per-write cost increasing with thread count, pointing at `wgpu::Queue`'s own internal synchronization as a separate contributor that restructuring SceneDB's locks cannot remove.
 
 **Staleness / liveness.** Two checks are required because they represent different facts and now use different indices. The entity-generation buffer answers “is this still the same entity?” at `entity.index()`; a per-component presence buffer answers “does this component-local row currently contain `T`?” at `gpu_row::<T>(entity)`. Removing `T` leaves the entity generation unchanged, writes `presence_T[component_row] = 0`, and queues zero tombstones for `T`'s value partners. Despawn does those component clears and advances `generations[entity_index]`. All writes are deferred until `world.flush_gpu_mirror`. A projection entry that needs shader-side liveness validation therefore carries both indices (plus the captured generation). Bind presence with `component_presence_buffer_snapshot_for_id(component_id::<T>())` and generation with `GpuMirrorHandle::generations().buffer_snapshot()`:
 
@@ -1167,7 +1171,7 @@ Reallocation preserves existing bytes via a `copy_buffer_to_buffer`, and bumps `
 ## Crates
 
 - **pulsar_scenedb** — the core library (ECS + spatial + GPU + replication). `replication` is always available (no feature gate, C0-compatible).
-- **pulsar_scenedb_derive** — `#[derive(SceneStore)]` for Pod impls and GPU dispatch boilerplate; `#[scenedb_subsystem]`/`#[subsystem_method]` for reflection-database method registration (see [Integrating with SceneDB](#integrating-with-scenedb)).
+- **pulsar_scenedb_derive** — `#[derive(SceneStore)]` for field-column metadata and GPU dispatch boilerplate; `#[scenedb_subsystem]`/`#[subsystem_method]` for reflection-database method registration (see [Integrating with SceneDB](#integrating-with-scenedb)).
 - **scenedb_dashboard** — runtime TUI monitoring dashboard.
 
 ## FAQ

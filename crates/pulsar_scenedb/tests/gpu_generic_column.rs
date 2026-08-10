@@ -89,7 +89,12 @@ fn scene_cfg() -> SceneGpuConfig {
 /// even by accident (the point being proven is type-level isolation, not
 /// merely "these two happen not to overlap").
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(
+    Clone,
+    Copy,
+    pulsar_scenedb::bytemuck::Zeroable,
+    pulsar_scenedb::bytemuck::Pod,
+)]
 struct TestMaterial {
     base_color: [f32; 4],
     roughness: f32,
@@ -101,7 +106,9 @@ struct TestMaterial {
 // bytes are ever read as anything but the struct's own declared fields.
 unsafe impl Pod for TestMaterial {}
 
-impl GpuColumnSet for TestMaterial {
+// SAFETY: the descriptor covers the entire padding-free TestMaterial value at
+// offset zero and uses its exact TypeToken for both field and stored value.
+unsafe impl GpuColumnSet for TestMaterial {
     fn gpu_columns() -> Vec<GpuColumnDesc> {
         vec![GpuColumnDesc {
             field_token: TypeToken::of::<TestMaterial>(),
@@ -132,7 +139,12 @@ impl GpuColumnSet for TestMaterial {
 
 /// Stand-in for a light row.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(
+    Clone,
+    Copy,
+    pulsar_scenedb::bytemuck::Zeroable,
+    pulsar_scenedb::bytemuck::Pod,
+)]
 struct TestLight {
     position: [f32; 3],
     intensity: f32,
@@ -143,7 +155,9 @@ struct TestLight {
 // SAFETY: see TestMaterial's impl above -- same reasoning.
 unsafe impl Pod for TestLight {}
 
-impl GpuColumnSet for TestLight {
+// SAFETY: the descriptor covers the entire padding-free TestLight value at
+// offset zero and uses its exact TypeToken for both field and stored value.
+unsafe impl GpuColumnSet for TestLight {
     fn gpu_columns() -> Vec<GpuColumnDesc> {
         vec![GpuColumnDesc {
             field_token: TypeToken::of::<TestLight>(),

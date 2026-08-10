@@ -7,10 +7,14 @@
 
 use super::EngineGpuContext;
 
-/// Hard arena-exhaustion error (§8): surfaced to the caller, never a realloc.
+/// Geometry upload errors surfaced before allocator or GPU state is changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArenaError {
     Exhausted,
+    /// `wgpu::Queue::write_buffer` and buffer-copy ranges require sizes in
+    /// whole 4-byte words. Reject malformed raw asset blobs before touching
+    /// allocator state or relying on backend validation.
+    UnalignedLength,
 }
 
 /// First-fit byte-range suballocator over one buffer (design Rev 2 §3):
@@ -263,6 +267,9 @@ impl GeometryArena {
     /// 4-byte-aligned first-fit alloc + `write_buffer`. Returns the byte
     /// offset (the design §6.1 `vertex_offset` value). No CPU copy retained.
     pub fn upload_vertices(&mut self, queue: &wgpu::Queue, bytes: &[u8]) -> Result<u32, ArenaError> {
+        if bytes.len() % 4 != 0 {
+            return Err(ArenaError::UnalignedLength);
+        }
         let len = bytes.len() as u64;
         let offset = match self.vfree.alloc(len, 4) {
             Some(offset) => offset,
@@ -280,6 +287,9 @@ impl GeometryArena {
     /// 4-byte-aligned first-fit alloc + `write_buffer`. Returns the byte
     /// offset (the design §6.1 `index_offset` value). No CPU copy retained.
     pub fn upload_indices(&mut self, queue: &wgpu::Queue, bytes: &[u8]) -> Result<u32, ArenaError> {
+        if bytes.len() % 4 != 0 {
+            return Err(ArenaError::UnalignedLength);
+        }
         let len = bytes.len() as u64;
         let offset = match self.ifree.alloc(len, 4) {
             Some(offset) => offset,
@@ -356,7 +366,7 @@ impl GeometryArena {
 /// column below and the const size assert) — if the size assert ever fails,
 /// fix the field order/types, never insert manual padding fields.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct MeshMetadata {
     pub vertex_offset: u32,          // 0
     pub index_offset: u32,           // 4
@@ -480,7 +490,7 @@ impl MeshRegistry {
 /// load-bearing — if the size assert ever fails, fix the field order/types,
 /// never insert manual padding fields.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct ClusterNode {
     pub meshlet_offset: u32,      // 0
     pub meshlet_count: u32,       // 4
@@ -653,7 +663,7 @@ impl ClusterBuffer {
 /// const size assert) — if the size assert ever fails, fix the field
 /// order/types, never insert manual padding fields.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct MeshletEntry {
     pub sphere_x: f32,      // 0   bounding sphere center
     pub sphere_y: f32,      // 4
@@ -852,7 +862,7 @@ impl MeshletBuffer {
 /// stays full-precision `f32` (packing it, like `base_color`, would clamp
 /// emissive to LDR).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct MaterialRow {
     pub base_color: u32,             // 0  RGBA8-unorm packed base color factor (linear)
     pub metallic: f32,               // 4  metallic factor ∈ [0, 1]

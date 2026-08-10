@@ -11,18 +11,19 @@ pub const MAX_STRIDE_BYTES: u32 = 128;
 /// Every column starts on a cache-line boundary (spec §4.2).
 pub const COLUMN_ALIGN: usize = 64;
 
-/// Marker for types whose every byte pattern — in particular all-zero — is a
-/// valid value, so a column of them may be handed out as `&[T]` over the
-/// zero-initialised page allocation.
+/// Marker for types whose bytes are always initialized and whose every byte
+/// pattern — in particular all-zero — is a valid value, so a column of them
+/// may be handed out as `&[T]` over the zero-initialised page allocation and
+/// safely uploaded/serialized as raw bytes.
 ///
-/// `unsafe` to implement: implementors guarantee zero-init validity and no
-/// `Drop` glue. The M1b TypeToken layer builds the column-registration API on
-/// top of this bound.
+/// This deliberately strengthens SceneDB's historical zero-valid/Copy-only
+/// promise with [`bytemuck::Pod`]'s no-padding contract. Several GPU and
+/// replication paths read every byte; allowing implicit/uninitialized padding
+/// here would make those safe APIs undefined behavior.
 ///
 /// # Safety
-/// All-zero bytes must be a valid value of `Self`, and `Self` must be `Copy`
-/// with no `Drop`.
-pub unsafe trait Pod: Copy {}
+/// Implementors must satisfy every invariant of [`bytemuck::Pod`].
+pub unsafe trait Pod: bytemuck::Pod {}
 
 macro_rules! impl_pod {
     ($($t:ty),*) => { $( unsafe impl Pod for $t {} )* };
@@ -71,10 +72,11 @@ pub struct GenericColumn<T: 'static> {
     init_bits: Vec<u64>,
 }
 
-// SAFETY: `MaybeUninit` interior provides no extra thread-safety affordances;
-// external `&`/`&mut` borrowing discipline is sufficient.
-unsafe impl<T: 'static> Send for GenericColumn<T> {}
-unsafe impl<T: 'static> Sync for GenericColumn<T> {}
+// SAFETY: GenericColumn has the same Send/Sync requirements as the values it
+// owns/exposes. `MaybeUninit<T>` does not make a non-thread-safe T safe to
+// transfer or share; the bounds are therefore load-bearing.
+unsafe impl<T: Send + 'static> Send for GenericColumn<T> {}
+unsafe impl<T: Sync + 'static> Sync for GenericColumn<T> {}
 
 impl<T: 'static> GenericColumn<T> {
     pub fn new(capacity: u32) -> Self {
@@ -174,7 +176,7 @@ impl<T: 'static> Drop for GenericColumn<T> {
     }
 }
 
-impl<T: 'static> GenericColumnAny for GenericColumn<T> {
+impl<T: Send + Sync + 'static> GenericColumnAny for GenericColumn<T> {
     fn push_row(&mut self) {
         self.data.push(MaybeUninit::uninit());
     }
@@ -445,9 +447,10 @@ impl Page {
 }
 
 /// Typed column access — a view of all `capacity` slots (including dead rows;
-/// callers filter through liveness/len). Panics if `T`'s size doesn't match
-/// the registered `ColumnDesc` — the M1b TypeToken layer makes this statically
-/// safe; for now the size check guards against mis-typed access.
+/// callers filter through liveness/len). Panics if `T`'s size or alignment
+/// doesn't match the registered `ColumnDesc` — the M1b TypeToken layer makes
+/// normal call sites statically safe, while these checks keep the public raw
+/// descriptor constructor from turning a mismatch into an invalid reference.
 impl Page {
     pub fn column_slice<T: Pod>(&self, col: usize) -> &[T] {
         let len = self.assert_column::<T>(col);
@@ -467,7 +470,13 @@ impl Page {
     /// Raw bytes of a Pod column up to `rows` elements (for GPU sync).
     pub fn column_raw_bytes(&self, col: usize, rows: u32) -> &[u8] {
         let desc = self.layout.column_descs[col];
+        assert!(
+            rows <= self.layout.capacity,
+            "raw column row count exceeds page capacity"
+        );
         let byte_len = desc.size as usize * rows as usize;
+        // SAFETY: the checked row count bounds byte_len to this column's
+        // allocation. Pod columns are zero-initialized across full capacity.
         unsafe { std::slice::from_raw_parts(self.column_ptr(col), byte_len) }
     }
 
@@ -476,11 +485,16 @@ impl Page {
     /// (`crate::replication::Snapshot::restore_to_cells`).
     pub(crate) fn column_raw_bytes_mut(&mut self, col: usize, rows: u32) -> &mut [u8] {
         let desc = self.layout.column_descs[col];
+        assert!(
+            rows <= self.layout.capacity,
+            "raw column row count exceeds page capacity"
+        );
         let byte_len = desc.size as usize * rows as usize;
+        // SAFETY: as column_raw_bytes, with unique access through &mut self.
         unsafe { std::slice::from_raw_parts_mut(self.column_ptr_mut(col), byte_len) }
     }
 
-    /// Validates the column's element size matches `T` and returns the slice length.
+    /// Validates the column's element layout matches `T` and returns the slice length.
     #[inline]
     fn assert_column<T>(&self, col: usize) -> usize {
         let desc = self.layout.column_descs[col];
@@ -488,6 +502,16 @@ impl Page {
             desc.size as usize,
             std::mem::size_of::<T>(),
             "column type size mismatch"
+        );
+        assert_eq!(
+            desc.align as usize,
+            std::mem::align_of::<T>(),
+            "column type alignment mismatch"
+        );
+        debug_assert_eq!(
+            self.column_ptr(col) as usize % std::mem::align_of::<T>(),
+            0,
+            "page layout did not honor the registered column alignment"
         );
         self.layout.capacity as usize
     }
@@ -582,6 +606,14 @@ mod tests {
     fn wrong_element_size_panics() {
         let page = Page::new(&two_column_layout());
         let _ = page.column_slice::<u32>(0); // column 0 is u64
+    }
+
+    #[test]
+    #[should_panic(expected = "raw column row count exceeds page capacity")]
+    fn raw_byte_view_rejects_rows_past_capacity() {
+        let layout = PageLayout::new(&[ColumnDesc::of::<u32>()], 16).unwrap();
+        let page = Page::new(&layout);
+        let _ = page.column_raw_bytes(0, 17);
     }
 
     #[test]

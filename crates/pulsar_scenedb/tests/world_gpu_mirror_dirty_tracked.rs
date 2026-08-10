@@ -97,6 +97,48 @@ struct NanComponent {
 }
 
 #[test]
+fn raw_mutable_access_is_rejected_and_copy_edit_dispatches_the_mirror() {
+    let ctx = test_context();
+    let mut store = SceneGpuStore::new(&ctx, scene_cfg());
+    DifferentialComponent::register_gpu_columns_growable(&mut store, 8, ctx.device());
+    let store = Arc::new(store);
+    let mut world = World::new();
+    world.attach_gpu_mirror(GpuMirrorHandle::new(
+        Arc::clone(&store),
+        Arc::clone(ctx.queue()),
+    ));
+    let entity = world.spawn();
+    world.insert(
+        entity,
+        DifferentialComponent {
+            transform_version: 10,
+            cpu_debug_tag: 1,
+            material_version: 20,
+            authored_mesh: 30,
+        },
+    );
+    world.flush_gpu_mirror(ctx.queue()).unwrap();
+
+    let get_mut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world.get_mut::<DifferentialComponent>(entity);
+    }));
+    assert!(get_mut.is_err(), "get_mut bypassed GPU mirror dispatch");
+
+    let query_mut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world.query_mut::<&mut DifferentialComponent>();
+    }));
+    assert!(query_mut.is_err(), "query_mut bypassed GPU mirror dispatch");
+
+    world
+        .edit::<DifferentialComponent, _>(entity, |component| {
+            component.transform_version += 1;
+        })
+        .unwrap();
+    let edited = world.flush_gpu_mirror(ctx.queue()).unwrap();
+    assert_eq!((edited.ranges, edited.bytes), (1, 4));
+}
+
+#[test]
 fn in_place_replacement_dirties_only_changed_gpu_fields() {
     let ctx = test_context();
     let mut store = SceneGpuStore::new(&ctx, scene_cfg());

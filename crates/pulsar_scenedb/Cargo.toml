@@ -6,7 +6,7 @@ description = "SceneDB 2.0 — engine-wide spatial database (Layer 1 storage cor
 
 [features]
 default = []
-gpu = ["dep:wgpu", "dep:bytemuck"]
+gpu = ["dep:wgpu"]
 telemetry = ["dep:socket2", "dep:serde", "gpu"]
 
 [dependencies]
@@ -23,7 +23,7 @@ ahash             = "0.8"
 profiling         = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Profiling", rev = "12424a5f75166332f9f1d2741281f6fc4847b44d" }
 tracing           = { workspace = true }
 wgpu              = { version = "30", optional = true }
-bytemuck          = { version = "1.25", features = ["derive"], optional = true }
+bytemuck          = { version = "1.25", features = ["derive"] }
 
 [dev-dependencies]
 rand = "0.8"

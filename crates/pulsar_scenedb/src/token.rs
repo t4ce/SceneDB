@@ -105,11 +105,11 @@ mod tests {
     #[test]
     fn unregistered_type_has_no_reflection_info() {
         // A bare Pod type not registered with pulsar_reflection resolves to None.
+        #[repr(transparent)]
+        #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
         struct LocalUnregistered(#[allow(dead_code)] u32);
         // SAFETY: trivially Pod for the test (Copy + zero-valid). Not exported.
         unsafe impl crate::page::Pod for LocalUnregistered {}
-        impl Clone for LocalUnregistered { fn clone(&self) -> Self { Self(self.0) } }
-        impl Copy for LocalUnregistered {}
         assert!(TypeToken::of::<LocalUnregistered>().type_info().is_none());
     }
 }

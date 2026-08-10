@@ -542,11 +542,11 @@ impl<T: Replicable> Replicable for Option<T> {
 
 // NOTE: no blanket `impl<T: Replicable> Replicable for Box<T>` — `Box` is a
 // `#[fundamental]` type, so the compiler must treat it as potentially
-// overlapping with the `T: Pod` blanket impl above (a downstream crate could
-// legally write `unsafe impl Pod for Box<TheirLocalType>` precisely because
-// `Box` is fundamental), and rustc rejects the two blanket impls as
-// conflicting even though no such impl actually exists. If you need a boxed
-// field, implement `Replicable` directly for your concrete `Box<YourType>`
+// overlapping with the `T: Pod` blanket impl above. `Box` is fundamental, so
+// coherence must conservatively consider downstream implementations even
+// though SceneDB's strengthened `Pod: bytemuck::Pod` contract (and therefore
+// `Copy`) makes a sound Box implementation impossible in practice. If you
+// need a boxed field, implement `Replicable` directly for your concrete `Box<YourType>`
 // (a single non-blanket impl, which does not hit this rule) — it's just
 // `(**self).replicate_encode(buf)` / `Box::new(YourType::replicate_decode(bytes)?)`.
 

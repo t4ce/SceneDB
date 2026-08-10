@@ -39,26 +39,16 @@
 //! concurrent mark against every other one regardless of which (disjoint)
 //! rows they targeted. Fixed via [`ShadowRow`]: the shadow is
 //! `Vec<ShadowRow<T>>` instead of `Vec<T>`, where each element supports
-//! `&self`-based get/set (an `UnsafeCell` under a hand-written `Sync`, not a
-//! `Mutex`/`Cell` — `Cell<T>` itself is never `Sync`, which is exactly why a
-//! plain `Vec<Cell<T>>` doesn't work here despite every `T` being `Copy`).
-//! `mark_dirty`'s common case (row already fits) now only needs the outer
-//! lock's **read** side — multiple threads marking *disjoint* rows proceed
-//! concurrently, matching [`super::GrowableSceneBuffer::write_row_growing`]'s
-//! already-correct read-lock-first shape. Growth still needs the write lock
-//! (reallocating `Vec<ShadowRow<T>>` requires exclusive access, same as any
-//! `Vec` resize).
+//! `&self`-based get/set. The `UnsafeCell` is protected by a fixed set of
+//! row-striped mutexes: same-row writes serialize, while unrelated rows only
+//! contend on the rare hash collision. This is important because
+//! `mark_dirty(&self, ...)` is a public safe API; soundness cannot depend on
+//! callers informally promising never to race one row.
 //!
-//! **Soundness contract** (see [`ShadowRow`]'s own doc for the full
-//! argument): two threads must never call `mark_dirty`/`reserve` for the
-//! *same* row concurrently — trivially satisfied by every real caller,
-//! since a row corresponds to exactly one `Entity`, and `World::insert`'s
-//! own `&mut self` signature already prevents two threads from inserting
-//! onto the same entity concurrently one layer up. [`Self::flush`] is
-//! unaffected by any of this — it holds the outer lock's **write** side for
-//! its whole duration, so it never runs concurrently with any `mark_dirty`
-//! call (read-path or write-path), and reads every `ShadowRow` through that
-//! exclusive access.
+//! `mark_dirty`'s common case (row already fits) still only needs the outer
+//! lock's **read** side. Growth needs its write side (reallocating the shadow
+//! Vec requires exclusive access), and [`Self::flush`] holds that write side
+//! throughout, so neither can overlap any fast-path shadow write.
 //!
 //! **What this does NOT fix.** Helio#211's benchmark measured contention
 //! through `GrowableSceneBuffer::write_row_growing` (the growable map, not
@@ -80,7 +70,12 @@ use crate::gpu::scatter_write::ScatterWritePipeline;
 use crate::gpu::{DirtyMask, DynamicGpuBuffer, SyncStats};
 use crate::page::Pod;
 use std::cell::UnsafeCell;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Fixed synchronization overhead per dirty-tracked buffer. This avoids a
+/// mutex beside every row (which would dominate compact u32 columns), while
+/// making same-row writes safe. The mask keeps the modulo branch-free.
+const ROW_LOCK_SHARDS: usize = 1024;
 
 /// A single shadow row, readable/writable through `&self` — see this
 /// module's "Concurrency" doc section for the full soundness argument.
@@ -91,12 +86,10 @@ use std::sync::{Arc, RwLock};
 /// `SceneGpuStore`, itself shared across threads via `Arc`).
 struct ShadowRow<T>(UnsafeCell<T>);
 
-// SAFETY: `T: Send` is enough for `ShadowRow<T>: Sync` under this module's
-// documented contract — no two threads ever call `get`/`set` on the SAME
-// `ShadowRow` concurrently (a row belongs to exactly one Entity; see the
-// module doc), so there is never a genuine data race on the `UnsafeCell`'s
-// contents, only ever-disjoint single-writer access per row, synchronized
-// against `flush()`'s reads by the outer `RwLock`'s write-side exclusivity.
+// SAFETY: every shared-path write is serialized by the owning buffer's
+// row-striped mutex. Reads occur only while holding the outer RwLock's write
+// side, which excludes every shared-path writer. ShadowRow is private, so no
+// caller can bypass those two synchronization paths.
 unsafe impl<T: Send> Sync for ShadowRow<T> {}
 
 impl<T: Copy> ShadowRow<T> {
@@ -106,15 +99,14 @@ impl<T: Copy> ShadowRow<T> {
 
     #[inline]
     fn get(&self) -> T {
-        // SAFETY: single-writer-per-row contract (module doc) + `T: Copy`
-        // means this read never races a concurrent write to the same row,
-        // and never observes a partially-written value.
+        // SAFETY: called only under the owning state's exclusive write lock.
         unsafe { *self.0.get() }
     }
 
     #[inline]
     fn set(&self, value: T) {
-        // SAFETY: same contract as `get`.
+        // SAFETY: called either under the owning state's exclusive write
+        // lock or while holding this row's synchronization stripe.
         unsafe {
             *self.0.get() = value;
         }
@@ -307,6 +299,7 @@ pub struct DirtyTrackedSceneBuffer<T: Pod> {
     /// on `state`.
     scatter: Arc<ScatterWritePipeline>,
     state: RwLock<DirtyTrackedState<T>>,
+    row_locks: Box<[Mutex<()>]>,
 }
 
 impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
@@ -345,19 +338,26 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
                 scatter_indices,
                 scatter_values,
             }),
+            row_locks: (0..ROW_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             device,
         }
+    }
+
+    #[inline]
+    fn row_lock(&self, row: u32) -> &Mutex<()> {
+        // Fold high row bits into the low shard index so component-local rows
+        // separated by a power-of-two capacity do not always share a lock.
+        let mixed = row ^ (row >> 10) ^ (row >> 20);
+        &self.row_locks[mixed as usize & (ROW_LOCK_SHARDS - 1)]
     }
 
     /// Records `value` as row `row`'s new value and marks it dirty.
     ///
     /// Fast path (row already within the current shadow length — the
     /// overwhelming common case once a buffer has warmed up): only the
-    /// outer lock's **read** side is needed, via [`ShadowRow`]'s `&self`
-    /// get/set — multiple threads marking *disjoint* rows proceed
-    /// concurrently. See this module's "Concurrency" doc section for the
-    /// full soundness argument and its one real precondition (never call
-    /// this for the same row from two threads at once).
+    /// outer lock's **read** side plus one row stripe is needed. Same-row
+    /// writers serialize; disjoint rows proceed concurrently unless their
+    /// hashes collide. See this module's "Concurrency" section.
     ///
     /// Slow path (growth needed): escalates to the write lock, same as
     /// [`super::GrowableSceneBuffer::write_row_growing`]'s own
@@ -371,6 +371,10 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
                 .read()
                 .expect("DirtyTrackedSceneBuffer lock poisoned");
             if (row as usize) < state.shadow.len() {
+                let _row = self
+                    .row_lock(row)
+                    .lock()
+                    .expect("DirtyTrackedSceneBuffer row lock poisoned");
                 state.shadow[row as usize].set(value);
                 state.dirty.mark(row);
                 return;
@@ -404,10 +408,14 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             .state
             .write()
             .expect("DirtyTrackedSceneBuffer lock poisoned");
-        grow_shadow_to(&mut state, capacity as usize);
         if state.buf.capacity() < capacity {
             state.buf.reserve(&self.device, queue, capacity)?;
         }
+        // Grow the unbounded host shadow only after DynamicGpuBuffer has
+        // checked the device/configured ceiling. Otherwise an invalid huge
+        // reservation can hang or OOM in Vec growth instead of returning
+        // CapacityError as this API promises.
+        grow_shadow_to(&mut state, capacity as usize);
         Ok(())
     }
 
@@ -812,6 +820,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn concurrent_marks_to_the_same_row_never_publish_a_torn_value() {
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+        struct WideRow {
+            words: [u32; 8],
+        }
+        // SAFETY: repr(C) around one u32 array has no padding, every bit
+        // pattern is valid, and WideRow is Copy with no drop glue.
+        unsafe impl crate::page::Pod for WideRow {}
+
+        let (device, queue) = test_device();
+        let buf = Arc::new(DirtyTrackedSceneBuffer::new(
+            Arc::clone(&device),
+            "same-row-race-test",
+            1,
+        ));
+        let start = Arc::new(std::sync::Barrier::new(17));
+        std::thread::scope(|scope| {
+            for writer in 1..=16u32 {
+                let buf = Arc::clone(&buf);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..2_000 {
+                        buf.mark_dirty(0, WideRow { words: [writer; 8] });
+                    }
+                });
+            }
+            start.wait();
+        });
+
+        buf.flush(&queue);
+        let mut bytes = Vec::new();
+        buf.with_buffer(&mut |buffer| {
+            bytes = readback(&device, &queue, buffer, std::mem::size_of::<WideRow>() as u64)
+        });
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+            .collect();
+        assert!(
+            words.iter().all(|word| *word == words[0]),
+            "same-row writers published a torn row: {words:?}",
+        );
+        assert!((1..=16).contains(&words[0]));
+    }
+
     /// SceneDB#39: scattered rows (well above `SCATTER_RUN_THRESHOLD`, no
     /// two adjacent) must take the GPU-side scatter path and land every
     /// value at exactly the right row, with every untouched row still
@@ -909,8 +965,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "multiple of 4 bytes")]
     fn element_size_not_a_multiple_of_4_bytes_panics_at_construction() {
-        #[derive(Clone, Copy)]
-        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+        #[repr(transparent)]
         struct ThreeBytes([u8; 3]);
         unsafe impl Pod for ThreeBytes {}
 

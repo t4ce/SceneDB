@@ -8,21 +8,21 @@
 use pulsar_scenedb::*;
 
 // ---------------------------------------------------------------------------
-// 1.  Pod alignment bypass
-//     column_slice<T> only checks size_of::<T>(), NOT align_of::<T>().
-//     A column laid out at 4-byte alignment but accessed as a type with
-//     8-byte alignment produces a misaligned reference → UB.
+// 1.  Pod alignment mismatch
+//     A raw ColumnDesc may describe the same byte size with a different
+//     alignment. Typed access must reject it before constructing a reference.
 // ---------------------------------------------------------------------------
 
 /// A type with size 8 but alignment 4 — the same byte count as u64 but
 /// weaker alignment.
 #[repr(C, packed(4))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct PackedU64Pair(u32, u32);
 unsafe impl Pod for PackedU64Pair {}
 
 #[test]
-fn pod_alignment_bypass_size_check_passes() {
+#[should_panic(expected = "column type alignment mismatch")]
+fn pod_alignment_mismatch_is_rejected_on_read() {
     let cols = [ColumnDesc {
         size: std::mem::size_of::<PackedU64Pair>() as u32,  // 8
         align: std::mem::align_of::<PackedU64Pair>() as u32, // 4
@@ -30,16 +30,13 @@ fn pod_alignment_bypass_size_check_passes() {
     let layout = PageLayout::new(&cols, 16).unwrap();
     let mut page = Page::new(&layout);
     page.push_row();
-    // column_slice::<u64> succeeds: size_of::<u64>() == 8 matches desc.size.
-    // But align_of::<u64>() == 8 > column alignment 4 → the resulting
-    // &[u64] is misaligned. In practice this may work on x86-64 but it is
-    // still UB per the Rust abstract machine.
+    // Size alone matches, but the descriptor does not identify a u64 column.
     let _slice = page.column_slice::<u64>(0);
-    // Reading from _slice[0] is a misaligned u64 load.
 }
 
 #[test]
-fn pod_alignment_bypass_write_misaligned() {
+#[should_panic(expected = "column type alignment mismatch")]
+fn pod_alignment_mismatch_is_rejected_on_write() {
     let cols = [ColumnDesc {
         size: std::mem::size_of::<PackedU64Pair>() as u32,
         align: std::mem::align_of::<PackedU64Pair>() as u32,
@@ -48,7 +45,6 @@ fn pod_alignment_bypass_write_misaligned() {
     let mut page = Page::new(&layout);
     page.push_row();
     let slice = page.column_slice_mut::<u64>(0);
-    // Writing to a misaligned &mut [u64] is UB.
     slice[0] = 0xDEAD_BEEF_CAFE_BABE;
 }
 
@@ -111,11 +107,13 @@ fn set_property_raw_type_confusion_u32_as_f32() {
 //     reading through the other produces type-punned bytes.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[repr(transparent)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct TokenA([f32; 2]); // size 8
 unsafe impl Pod for TokenA {}
 
-#[derive(Clone, Copy)]
+#[repr(transparent)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct TokenB(u64); // also size 8
 unsafe impl Pod for TokenB {}
 
@@ -628,15 +626,15 @@ fn max_stride_exact_boundary() {
     assert!(CellStorage::new(&descs2, 16).is_err());
     // CellType::build also performs a holistic stride check:
     // 1 distinct 64-byte type = 64 user + 4 slot = 68 ≤ 128 → ok.
-    #[derive(Copy, Clone)]
-    #[repr(C)]
+    #[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::Pod)]
+    #[repr(transparent)]
     struct BigCol([u8; 64]);
     unsafe impl Pod for BigCol {}
     let ct = CellType::new("big").with(TypeToken::of::<BigCol>()).build().unwrap();
     let _cell = CellStorage::from_cell_type(&ct, 16).unwrap();
     // 2 × 64-byte types = 128 + 4 = 132 > 128 → rejected.
-    #[derive(Copy, Clone)]
-    #[repr(C)]
+    #[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::Pod)]
+    #[repr(transparent)]
     struct BigCol2([u8; 64]);
     unsafe impl Pod for BigCol2 {}
     let ct2 = CellType::new("too-big")
@@ -1086,8 +1084,8 @@ fn type_token_stable_across_calls() {
 // Inherent crate documentation issues (documented here because they are
 // observable from integration tests):
 //
-// - column_slice::<T> and column_slice_mut::<T> only check size, not
-//   alignment (proved above).
+// - typed Page access validates both size and alignment; the old
+//   size-only mismatch is covered above as a rejection regression.
 // - GenericColumn::swap desyncs init_bits (proved above).
 // - set_property_raw maps size 4 → f32 always, ignoring the property's
 //   actual type (documented above).

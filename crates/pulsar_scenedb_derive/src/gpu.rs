@@ -14,7 +14,7 @@ pub fn generate_gpu_column_set(
 ) -> TokenStream {
     if gpu_fields.is_empty() {
         return quote! {
-            impl #impl_generics ::pulsar_scenedb::GpuColumnSet for #name #ty_generics #where_clause {
+            unsafe impl #impl_generics ::pulsar_scenedb::GpuColumnSet for #name #ty_generics #where_clause {
                 fn gpu_columns() -> Vec<::pulsar_scenedb::GpuColumnDesc> {
                     Vec::new()
                 }
@@ -619,7 +619,7 @@ pub fn generate_gpu_column_set(
     };
 
     quote! {
-        impl #impl_generics ::pulsar_scenedb::GpuColumnSet for #name #ty_generics #where_clause {
+        unsafe impl #impl_generics ::pulsar_scenedb::GpuColumnSet for #name #ty_generics #where_clause {
             fn gpu_columns() -> Vec<::pulsar_scenedb::GpuColumnDesc> {
                 vec![
                     #(#column_descs),*

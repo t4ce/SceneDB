@@ -11,7 +11,8 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use pulsar_scenedb::*;
 use std::hint::black_box;
 
-#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, bytemuck::Zeroable, bytemuck::Pod)]
 struct Position {
     xyz: [f32; 3],
 }

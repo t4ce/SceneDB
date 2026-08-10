@@ -93,6 +93,10 @@ impl ComponentPresenceBuffer {
     }
 
     pub fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
+        // Check the bounded GPU allocation before attempting an equivalently
+        // huge host-side presence vector. Invalid reservations must remain a
+        // catchable CapacityError, not become allocator pressure/hangs.
+        self.buf.reserve(queue, capacity)?;
         {
             let mut rows = self
                 .rows
@@ -102,7 +106,7 @@ impl ComponentPresenceBuffer {
                 rows.resize_with(capacity as usize, || AtomicBool::new(false));
             }
         }
-        self.buf.reserve(queue, capacity)
+        Ok(())
     }
 
     pub fn shrink_to_fit(

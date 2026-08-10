@@ -888,7 +888,7 @@ fn large_scale(c: &mut Criterion) {
             world.insert(e, Health(100));
         }
 
-        let archetypes = world.archetypes.len();
+        let archetypes = world.archetype_count();
         println!("  large_scale n={}: {} archetypes", n, archetypes);
 
         group.throughput(Throughput::Elements(n as u64));

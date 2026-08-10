@@ -612,7 +612,7 @@ fn correctness_schedule_basic() {
 
     let mut schedule = Schedule::new();
     schedule.add_system("inc_health", |world, _time| {
-        for (_, (health,)) in world.query::<(&mut Health,)>() {
+        for (_, (health,)) in world.query_mut::<(&mut Health,)>() {
             health.0 = health.0 + 1;
         }
     });
@@ -650,12 +650,12 @@ fn correctness_schedule_order() {
 
     let mut schedule = Schedule::new();
     schedule.add_system("first", |world, _time| {
-        for (_, (health,)) in world.query::<(&mut Health,)>() {
+        for (_, (health,)) in world.query_mut::<(&mut Health,)>() {
             health.0 = health.0 + 10;
         }
     });
     schedule.add_system("second", |world, _time| {
-        for (_, (health,)) in world.query::<(&mut Health,)>() {
+        for (_, (health,)) in world.query_mut::<(&mut Health,)>() {
             health.0 = health.0 * 2;
         }
     });
@@ -1741,7 +1741,7 @@ fn stress_schedule_mutate_components() {
 
     let mut schedule = Schedule::new();
     schedule.add_system("toggle", |world, _time| {
-        for (_, (toggle,)) in world.query::<(&mut Toggle,)>() {
+        for (_, (toggle,)) in world.query_mut::<(&mut Toggle,)>() {
             toggle.0 = !toggle.0;
         }
     });

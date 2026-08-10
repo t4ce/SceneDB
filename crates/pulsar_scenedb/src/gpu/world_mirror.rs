@@ -194,8 +194,13 @@ impl GenerationMirror {
     /// reserve all value columns and still take a surprise generation-buffer
     /// reallocation on the next flush.
     pub(crate) fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError> {
+        // Validate/grow the bounded GPU allocation first. Doing the CPU
+        // `Vec<AtomicBool>` reserve first lets an impossible request such as
+        // `u32::MAX` attempt a multi-gigabyte host allocation before the
+        // device limit can return the promised catchable CapacityError.
+        self.buf.reserve(queue, capacity)?;
         self.gpu_mirrored_rows.reserve(capacity);
-        self.buf.reserve(queue, capacity)
+        Ok(())
     }
 
     pub(crate) fn shrink_to_fit(
@@ -601,12 +606,11 @@ pub fn write_gpu_columns_at_row<T: GpuColumnSet>(
 ) {
     for col in T::gpu_columns() {
         let size = col.field_token.desc().size as usize;
-        // SAFETY: `field_offset`/`size` describe a field within `T`, computed
-        // by the derive from `T`'s own layout (`offset_of!` + `size_of`) at
-        // macro-expansion time, so the byte range is in-bounds of `data` and
-        // fully initialized. `T: GpuColumnSet: Pod` guarantees every bit
-        // pattern in that range is a valid read (no padding-UB, no enum
-        // niches to violate).
+        // SAFETY: this is exactly the unsafe contract of `GpuColumnSet`:
+        // `field_offset`/`size` identify a fully initialized, padding-free
+        // Pod field within `T`, and the descriptor's tokens match that field.
+        // The whole component deliberately need not be Pod; CPU-only fields
+        // may contain arbitrary rich Rust values.
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts((data as *const T as *const u8).add(col.field_offset), size)
         };
@@ -663,10 +667,31 @@ pub fn clear_gpu_columns_at_row<T: GpuColumnSet>(
     queue: &wgpu::Queue,
     row: u32,
 ) {
-    // SAFETY: `GpuColumnSet: Pod`, whose contract explicitly requires the
-    // all-zero representation to be a valid value.
-    let zero = unsafe { std::mem::zeroed::<T>() };
-    write_gpu_columns_at_row(store, queue, row, &zero, true);
+    // Never construct an all-zero `T`: GpuColumnSet only promises that its
+    // described GPU fields are Pod. A component may also contain String,
+    // Vec, NonZero*, references, or other CPU-only values for which a zeroed
+    // whole component would be immediate UB. Zero the partnered rows by
+    // descriptor instead. Removal is cold enough that one reusable scratch
+    // allocation is preferable to expanding the unsafe surface.
+    let columns = T::gpu_columns();
+    let max_size = columns
+        .iter()
+        .map(|column| column.field_token.desc().size as usize)
+        .max()
+        .unwrap_or(0);
+    let zero = vec![0_u8; max_size];
+    for column in columns {
+        let size = column.field_token.desc().size as usize;
+        write_gpu_column_bytes_at_row(
+            store,
+            queue,
+            row,
+            column.field_token.id(),
+            column.mode,
+            &zero[..size],
+            true,
+        );
+    }
 }
 
 // ── Link-time dispatch registry ─────────────────────────────────────────
@@ -788,16 +813,20 @@ mod tests {
     /// `#[derive(SceneStore)]` would generate for one `#[gpu]` field),
     /// registered exactly the way the derive's generated code would.
     #[repr(transparent)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
     struct TestField(u32);
     unsafe impl crate::page::Pod for TestField {}
 
-    #[derive(Clone, Copy)]
     struct TestComponent {
         value: TestField,
+        // Proves the generic clear path never zero-constructs the whole
+        // component. This is intentionally non-Copy and not zero-valid.
+        #[allow(dead_code)]
+        cpu_only: String,
     }
-    unsafe impl crate::page::Pod for TestComponent {}
-    impl GpuColumnSet for TestComponent {
+    // SAFETY: the sole descriptor names `value` at its exact offset and uses
+    // the padding-free `TestField` wrapper as both field and value token.
+    unsafe impl GpuColumnSet for TestComponent {
         fn gpu_columns() -> Vec<GpuColumnDesc> {
             vec![GpuColumnDesc {
                 field_token: TypeToken::of::<TestField>(),

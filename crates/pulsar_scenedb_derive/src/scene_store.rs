@@ -343,7 +343,6 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         ));
     }
 
-    let field_types: Vec<&Type> = field_infos.iter().map(|f| &f.ty).collect();
     let gpu_fields: Vec<&FieldInfo> = field_infos.iter().filter(|f| f.is_gpu).collect();
 
     if !gpu_fields.is_empty() && !input.generics.params.is_empty() {
@@ -358,14 +357,6 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let is_packed = struct_is_packed(&input.attrs);
     validate_gpu_buffer_names(&gpu_fields, is_packed)?;
-
-    let pod_impl = generate_pod_impl(
-        name,
-        &impl_generics,
-        &ty_generics,
-        where_clause,
-        &field_types,
-    );
 
     // Two `SceneColumnSet` impls, `cfg`-split on the `gpu` feature: with it
     // on, `#[gpu]` fields' CellType column tokens must match the wrapper
@@ -432,8 +423,6 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     // satisfies.  An explicit impl would conflict.
 
     Ok(quote! {
-        #pod_impl
-
         #[cfg(feature = "gpu")]
         const _: () = {
             #(#gpu_wrapper_defs)*
@@ -443,37 +432,6 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         #[cfg(not(feature = "gpu"))]
         #scene_column_set_no_gpu
     })
-}
-
-// ── Pod impl ──────────────────────────────────────────────────────────────
-
-fn generate_pod_impl(
-    name: &Ident,
-    impl_generics: &syn::ImplGenerics,
-    ty_generics: &syn::TypeGenerics,
-    where_clause: Option<&syn::WhereClause>,
-    field_types: &[&Type],
-) -> TokenStream {
-    let pod_bounds: Vec<_> = field_types
-        .iter()
-        .map(|ty| {
-            quote! { #ty: ::pulsar_scenedb::page::Pod }
-        })
-        .collect();
-
-    let mut wc: syn::WhereClause = where_clause.cloned().unwrap_or_else(|| syn::WhereClause {
-        where_token: Default::default(),
-        predicates: syn::punctuated::Punctuated::new(),
-    });
-
-    for bound in &pod_bounds {
-        let pred: syn::WherePredicate = syn::parse_quote! { #bound };
-        wc.predicates.push(pred);
-    }
-
-    quote! {
-        unsafe impl #impl_generics ::pulsar_scenedb::page::Pod for #name #ty_generics #wc {}
-    }
 }
 
 #[cfg(test)]

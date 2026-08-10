@@ -22,7 +22,8 @@ macro_rules! marker_types {
 marker_types!(Shard0, Shard1, Shard2, Shard3, Shard4, Shard5, Shard6, Shard7, Shard8, Shard9);
 marker_types!(Group0, Group1, Group2, Group3, Group4);
 
-#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Zeroable, bytemuck::Pod)]
 struct Position(f32, f32, f32);
 // SAFETY: three `f32`s, no padding, no niches — trivially safe to
 // zero-init/byte-reinterpret. Needed so `Position: Replicable` via the
@@ -80,7 +81,7 @@ fn ten_thousand_entities_fifty_archetypes_four_client_relevance() {
     // {Position} -> {Position, ShardX} -> {Position, ShardX, GroupY}) stay
     // registered but end up with zero live entities; only the 50 final
     // combinations should hold any.
-    let non_empty = world.archetypes.iter().filter(|a| !a.entities.is_empty()).count();
+    let non_empty = world.non_empty_archetype_count();
     assert_eq!(non_empty, ARCHETYPE_COUNT, "expected exactly 50 archetypes holding live entities");
 
     let pos_cid = component_id::<Position>();

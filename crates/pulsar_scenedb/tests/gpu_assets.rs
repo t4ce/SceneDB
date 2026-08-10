@@ -127,12 +127,12 @@ fn tiny_arena_exhaustion_is_a_hard_error() {
     // First alloc consumes the whole vertex arena.
     assert!(arena.upload_vertices(ctx.queue(), &[1u8; 16]).is_ok());
     // Second alloc has nowhere to go.
-    let err = arena.upload_vertices(ctx.queue(), &[2u8; 1]);
+    let err = arena.upload_vertices(ctx.queue(), &[2u8; 4]);
     assert_eq!(err, Err(ArenaError::Exhausted));
 
     // Same for the index arena.
     assert!(arena.upload_indices(ctx.queue(), &[1u8; 16]).is_ok());
-    let err = arena.upload_indices(ctx.queue(), &[2u8; 1]);
+    let err = arena.upload_indices(ctx.queue(), &[2u8; 4]);
     assert_eq!(err, Err(ArenaError::Exhausted));
 }
 
@@ -187,6 +187,27 @@ fn growable_geometry_preserves_offsets_bytes_and_named_identity() {
     assert_eq!(reused, 16);
     assert_eq!(arena.vertex_epoch(), 1, "free-range reuse needs no allocation growth");
     assert_eq!(arena.vertex_high_water_bytes(), 24);
+}
+
+#[test]
+fn geometry_rejects_unaligned_raw_payloads_transactionally() {
+    let ctx = test_context();
+    let mut arena = GeometryArena::new(&ctx, 64, 64);
+
+    assert_eq!(
+        arena.upload_vertices(ctx.queue(), &[1u8; 3]),
+        Err(ArenaError::UnalignedLength),
+    );
+    assert_eq!(
+        arena.upload_indices(ctx.queue(), &[2u8; 6]),
+        Err(ArenaError::UnalignedLength),
+    );
+    assert_eq!(arena.vertex_high_water_bytes(), 0);
+    assert_eq!(arena.index_high_water_bytes(), 0);
+    assert_eq!(arena.upload_count(), 0);
+
+    assert_eq!(arena.upload_vertices(ctx.queue(), &[3u8; 4]), Ok(0));
+    assert_eq!(arena.upload_indices(ctx.queue(), &[4u8; 4]), Ok(0));
 }
 
 #[test]
