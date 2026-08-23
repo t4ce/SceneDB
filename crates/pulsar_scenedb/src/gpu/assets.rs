@@ -27,7 +27,9 @@ struct RangeList {
 
 impl RangeList {
     fn new(total: u64) -> Self {
-        Self { free: vec![(0, total)] }
+        Self {
+            free: vec![(0, total)],
+        }
     }
 
     fn alloc(&mut self, len: u64, align: u64) -> Option<u64> {
@@ -55,13 +57,16 @@ impl RangeList {
 
     fn free(&mut self, offset: u64, len: u64) {
         debug_assert!(
-            self.free.iter().all(|&(o, l)| offset + len <= o || o + l <= offset),
+            self.free
+                .iter()
+                .all(|&(o, l)| offset + len <= o || o + l <= offset),
             "double-free or overlapping free range"
         );
         let idx = self.free.partition_point(|&(o, _)| o < offset);
         self.free.insert(idx, (offset, len));
         // Coalesce with next, then with previous.
-        if idx + 1 < self.free.len() && self.free[idx].0 + self.free[idx].1 == self.free[idx + 1].0 {
+        if idx + 1 < self.free.len() && self.free[idx].0 + self.free[idx].1 == self.free[idx + 1].0
+        {
             self.free[idx].1 += self.free[idx + 1].1;
             self.free.remove(idx + 1);
         }
@@ -137,14 +142,7 @@ impl GeometryArena {
         vertex_key: &'static str,
         index_key: &'static str,
     ) -> Self {
-        Self::new_inner(
-            ctx,
-            vertex_bytes,
-            index_bytes,
-            vertex_key,
-            index_key,
-            true,
-        )
+        Self::new_inner(ctx, vertex_bytes, index_bytes, vertex_key, index_key, true)
     }
 
     fn new_inner(
@@ -157,8 +155,16 @@ impl GeometryArena {
     ) -> Self {
         assert!(vertex_bytes > 0, "geometry vertex arena must not be empty");
         assert!(index_bytes > 0, "geometry index arena must not be empty");
-        assert_eq!(vertex_bytes % 4, 0, "geometry vertex arena must be 4-byte aligned");
-        assert_eq!(index_bytes % 4, 0, "geometry index arena must be 4-byte aligned");
+        assert_eq!(
+            vertex_bytes % 4,
+            0,
+            "geometry vertex arena must be 4-byte aligned"
+        );
+        assert_eq!(
+            index_bytes % 4,
+            0,
+            "geometry index arena must be 4-byte aligned"
+        );
         let vertex = ctx.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some(vertex_key),
             size: vertex_bytes,
@@ -215,8 +221,8 @@ impl GeometryArena {
     fn grow_vertex(&mut self, queue: &wgpu::Queue, required_tail: u64) -> Result<(), ArenaError> {
         let device = self.grow_device.as_ref().ok_or(ArenaError::Exhausted)?;
         let max = device.limits().max_buffer_size.min(u32::MAX as u64) & !3;
-        let new_bytes = Self::grown_size(self.vertex_bytes, required_tail, max)
-            .ok_or(ArenaError::Exhausted)?;
+        let new_bytes =
+            Self::grown_size(self.vertex_bytes, required_tail, max).ok_or(ArenaError::Exhausted)?;
         let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(self.vertex_key),
             size: new_bytes,
@@ -231,7 +237,8 @@ impl GeometryArena {
         });
         encoder.copy_buffer_to_buffer(self.vertex.as_ref(), 0, &new_buffer, 0, self.vertex_bytes);
         queue.submit([encoder.finish()]);
-        self.vfree.free(self.vertex_bytes, new_bytes - self.vertex_bytes);
+        self.vfree
+            .free(self.vertex_bytes, new_bytes - self.vertex_bytes);
         self.vertex = Box::new(new_buffer);
         self.vertex_bytes = new_bytes;
         self.vertex_epoch = self.vertex_epoch.wrapping_add(1);
@@ -241,8 +248,8 @@ impl GeometryArena {
     fn grow_index(&mut self, queue: &wgpu::Queue, required_tail: u64) -> Result<(), ArenaError> {
         let device = self.grow_device.as_ref().ok_or(ArenaError::Exhausted)?;
         let max = device.limits().max_buffer_size.min(u32::MAX as u64) & !3;
-        let new_bytes = Self::grown_size(self.index_bytes, required_tail, max)
-            .ok_or(ArenaError::Exhausted)?;
+        let new_bytes =
+            Self::grown_size(self.index_bytes, required_tail, max).ok_or(ArenaError::Exhausted)?;
         let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(self.index_key),
             size: new_bytes,
@@ -257,7 +264,8 @@ impl GeometryArena {
         });
         encoder.copy_buffer_to_buffer(self.index.as_ref(), 0, &new_buffer, 0, self.index_bytes);
         queue.submit([encoder.finish()]);
-        self.ifree.free(self.index_bytes, new_bytes - self.index_bytes);
+        self.ifree
+            .free(self.index_bytes, new_bytes - self.index_bytes);
         self.index = Box::new(new_buffer);
         self.index_bytes = new_bytes;
         self.index_epoch = self.index_epoch.wrapping_add(1);
@@ -266,7 +274,11 @@ impl GeometryArena {
 
     /// 4-byte-aligned first-fit alloc + `write_buffer`. Returns the byte
     /// offset (the design §6.1 `vertex_offset` value). No CPU copy retained.
-    pub fn upload_vertices(&mut self, queue: &wgpu::Queue, bytes: &[u8]) -> Result<u32, ArenaError> {
+    pub fn upload_vertices(
+        &mut self,
+        queue: &wgpu::Queue,
+        bytes: &[u8],
+    ) -> Result<u32, ArenaError> {
         if bytes.len() % 4 != 0 {
             return Err(ArenaError::UnalignedLength);
         }
@@ -278,7 +290,10 @@ impl GeometryArena {
                 self.vfree.alloc(len, 4).ok_or(ArenaError::Exhausted)?
             }
         };
-        debug_assert!(offset <= u32::MAX as u64, "arena offset exceeds the u32 C5 contract");
+        debug_assert!(
+            offset <= u32::MAX as u64,
+            "arena offset exceeds the u32 C5 contract"
+        );
         queue.write_buffer(self.vertex.as_ref(), offset, bytes);
         self.upload_count += 1;
         Ok(offset as u32)
@@ -298,7 +313,10 @@ impl GeometryArena {
                 self.ifree.alloc(len, 4).ok_or(ArenaError::Exhausted)?
             }
         };
-        debug_assert!(offset <= u32::MAX as u64, "arena offset exceeds the u32 C5 contract");
+        debug_assert!(
+            offset <= u32::MAX as u64,
+            "arena offset exceeds the u32 C5 contract"
+        );
         queue.write_buffer(self.index.as_ref(), offset, bytes);
         self.upload_count += 1;
         Ok(offset as u32)
@@ -368,17 +386,17 @@ impl GeometryArena {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct MeshMetadata {
-    pub vertex_offset: u32,          // 0
-    pub index_offset: u32,           // 4
-    pub index_count: u32,            // 8
-    pub base_vertex: i32,            // 12
-    pub material_index: u32,         // 16
-    pub lod_count: u32,              // 20
-    pub lod_distances: [f32; 4],     // 24
-    pub local_aabb_center: [f32; 3], // 40
-    pub cluster_table_offset: u32,   // 52
+    pub vertex_offset: u32,           // 0
+    pub index_offset: u32,            // 4
+    pub index_count: u32,             // 8
+    pub base_vertex: i32,             // 12
+    pub material_index: u32,          // 16
+    pub lod_count: u32,               // 20
+    pub lod_distances: [f32; 4],      // 24
+    pub local_aabb_center: [f32; 3],  // 40
+    pub cluster_table_offset: u32,    // 52
     pub local_aabb_extents: [f32; 3], // 56
-    pub meshlet_count: u32,          // 68
+    pub meshlet_count: u32,           // 68
 } // = 72 bytes (C5/§6.1)
 const _: () = assert!(std::mem::size_of::<MeshMetadata>() == 72);
 // SAFETY: `MeshMetadata` is `#[repr(C)]`, `Copy`, every field is itself POD
@@ -424,7 +442,12 @@ impl MeshRegistry {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        Self { buf, entries: Vec::new(), max_meshes, upload_count: 0 }
+        Self {
+            buf,
+            entries: Vec::new(),
+            max_meshes,
+            upload_count: 0,
+        }
     }
 
     /// C5 XOR rule: exactly one of `{lod_count, cluster_table_offset}` must
@@ -438,7 +461,11 @@ impl MeshRegistry {
             return Err(MeshError::RegistryFull);
         }
         let index = self.entries.len() as u32;
-        queue.write_buffer(&self.buf, index as u64 * 72, super::as_bytes(std::slice::from_ref(&m)));
+        queue.write_buffer(
+            &self.buf,
+            index as u64 * 72,
+            super::as_bytes(std::slice::from_ref(&m)),
+        );
         self.upload_count += 1;
         self.entries.push(m);
         Ok(index)
@@ -492,15 +519,15 @@ impl MeshRegistry {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct ClusterNode {
-    pub meshlet_offset: u32,      // 0
-    pub meshlet_count: u32,       // 4
-    pub parent_error: f32,        // 8
-    pub self_error: f32,          // 12  invariant: self_error < parent_error
-    pub group_id: u32,            // 16
-    pub child_offset: u32,        // 20
-    pub child_count: u32,         // 24
-    pub padding: u32,             // 28  must be 0
-    pub bounding_sphere: [f32; 4],// 32  xyz center, w radius
+    pub meshlet_offset: u32,       // 0
+    pub meshlet_count: u32,        // 4
+    pub parent_error: f32,         // 8
+    pub self_error: f32,           // 12  invariant: self_error < parent_error
+    pub group_id: u32,             // 16
+    pub child_offset: u32,         // 20
+    pub child_count: u32,          // 24
+    pub padding: u32,              // 28  must be 0
+    pub bounding_sphere: [f32; 4], // 32  xyz center, w radius
 } // = 48 bytes (C5)
 const _: () = assert!(std::mem::size_of::<ClusterNode>() == 48);
 // SAFETY: `ClusterNode` is `#[repr(C)]`, `Copy`, every field is itself POD
@@ -570,8 +597,14 @@ impl ClusterBuffer {
             padding: 0,
             bounding_sphere: [0.0, 0.0, 0.0, 0.0],
         };
-        ctx.queue().write_buffer(&buf, 0, super::as_bytes(std::slice::from_ref(&sentinel)));
-        Self { buf, nodes: vec![sentinel], max_nodes, upload_count: 1 }
+        ctx.queue()
+            .write_buffer(&buf, 0, super::as_bytes(std::slice::from_ref(&sentinel)));
+        Self {
+            buf,
+            nodes: vec![sentinel],
+            max_nodes,
+            upload_count: 1,
+        }
     }
 
     /// Appends a mesh's DAG nodes; returns the starting node offset (the C5
@@ -579,7 +612,11 @@ impl ClusterBuffer {
     /// padding == 0 for EVERY node BEFORE reserving space (a rejected batch
     /// must not consume offsets). Checks capacity (BufferFull), then writes
     /// the batch at `node_offset as u64 * 48` and returns the starting offset.
-    pub fn append(&mut self, queue: &wgpu::Queue, nodes: &[ClusterNode]) -> Result<u32, ClusterError> {
+    pub fn append(
+        &mut self,
+        queue: &wgpu::Queue,
+        nodes: &[ClusterNode],
+    ) -> Result<u32, ClusterError> {
         // Validate EVERY node before allocating offsets.
         for node in nodes {
             // Deliberate `!(a < b)` form (not `a >= b`): IEEE-754 makes every
@@ -745,7 +782,12 @@ impl MeshletBuffer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        Self { buf, entries: Vec::new(), max_entries, upload_count: 0 }
+        Self {
+            buf,
+            entries: Vec::new(),
+            max_entries,
+            upload_count: 0,
+        }
     }
 
     /// Appends a batch of meshlet entries; returns the starting entry offset
@@ -754,7 +796,11 @@ impl MeshletBuffer {
     /// counts) BEFORE reserving space (a rejected batch must not consume
     /// offsets). Checks capacity (`BufferFull`), then writes the batch at
     /// `entry_offset as u64 * 32` and returns the starting offset.
-    pub fn append(&mut self, queue: &wgpu::Queue, entries: &[MeshletEntry]) -> Result<u32, MeshletError> {
+    pub fn append(
+        &mut self,
+        queue: &wgpu::Queue,
+        entries: &[MeshletEntry],
+    ) -> Result<u32, MeshletError> {
         // Validate EVERY entry before allocating offsets.
         for entry in entries {
             // Deliberate `!(r > 0.0)` form (not `r <= 0.0`): IEEE-754 makes
@@ -788,7 +834,11 @@ impl MeshletBuffer {
         // in one write (destinations are contiguous — matches rebuild's bulk
         // style).
         let start_offset = current_len;
-        queue.write_buffer(&self.buf, start_offset as u64 * 32, super::as_bytes(entries));
+        queue.write_buffer(
+            &self.buf,
+            start_offset as u64 * 32,
+            super::as_bytes(entries),
+        );
         self.upload_count += 1;
         self.entries.extend_from_slice(entries);
 
@@ -864,22 +914,22 @@ impl MeshletBuffer {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct MaterialRow {
-    pub base_color: u32,             // 0  RGBA8-unorm packed base color factor (linear)
-    pub metallic: f32,               // 4  metallic factor ∈ [0, 1]
-    pub roughness: f32,              // 8  perceptual roughness factor ∈ [0, 1]
-    pub normal_scale: f32,           // 12 normal-map strength multiplier (1.0 = authored)
-    pub emissive_r: f32,             // 16 emissive color, red (linear)
-    pub emissive_g: f32,             // 20 emissive color, green (linear)
-    pub emissive_b: f32,             // 24 emissive color, blue (linear)
-    pub emissive_intensity: f32,     // 28 HDR emissive multiplier (nits-scale scalar)
-    pub tex_albedo: u32,             // 32 bindless slot: albedo/base-color map
-    pub tex_normal: u32,             // 36 bindless slot: tangent-space normal map
+    pub base_color: u32,         // 0  RGBA8-unorm packed base color factor (linear)
+    pub metallic: f32,           // 4  metallic factor ∈ [0, 1]
+    pub roughness: f32,          // 8  perceptual roughness factor ∈ [0, 1]
+    pub normal_scale: f32,       // 12 normal-map strength multiplier (1.0 = authored)
+    pub emissive_r: f32,         // 16 emissive color, red (linear)
+    pub emissive_g: f32,         // 20 emissive color, green (linear)
+    pub emissive_b: f32,         // 24 emissive color, blue (linear)
+    pub emissive_intensity: f32, // 28 HDR emissive multiplier (nits-scale scalar)
+    pub tex_albedo: u32,         // 32 bindless slot: albedo/base-color map
+    pub tex_normal: u32,         // 36 bindless slot: tangent-space normal map
     pub tex_metallic_roughness: u32, // 40 bindless slot: metallic-roughness (ORM) map
-    pub tex_emissive: u32,           // 44 bindless slot: emissive map
-    pub radiant_graph_index: u32,    // 48 index into the engine's Radiant shader-graph registry
-    pub flags: u32,                  // 52 feature bits 0-3 (see above), 4-31 reserved (must be 0)
-    pub alpha_cutoff: f32,           // 56 alpha-test threshold ∈ [0, 1] (meaningful when flags bit 2 set)
-    pub reserved: u32,               // 60 must be zero
+    pub tex_emissive: u32,       // 44 bindless slot: emissive map
+    pub radiant_graph_index: u32, // 48 index into the engine's Radiant shader-graph registry
+    pub flags: u32,              // 52 feature bits 0-3 (see above), 4-31 reserved (must be 0)
+    pub alpha_cutoff: f32, // 56 alpha-test threshold ∈ [0, 1] (meaningful when flags bit 2 set)
+    pub reserved: u32,     // 60 must be zero
 } // = 64 bytes (C5/§10.1, Rev 2.4 R8)
 const _: () = assert!(std::mem::size_of::<MaterialRow>() == 64);
 // SAFETY: `MaterialRow` is `#[repr(C)]`, `Copy`, every field is itself POD
@@ -947,7 +997,12 @@ impl MaterialRegistry {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        Self { buf, entries: Vec::new(), max_materials, upload_count: 0 }
+        Self {
+            buf,
+            entries: Vec::new(),
+            max_materials,
+            upload_count: 0,
+        }
     }
 
     /// R8 validation: `metallic`, `roughness`, `alpha_cutoff` ∈ [0, 1]
@@ -981,7 +1036,11 @@ impl MaterialRegistry {
             return Err(MaterialError::RegistryFull);
         }
         let index = self.entries.len() as u32;
-        queue.write_buffer(&self.buf, index as u64 * 64, super::as_bytes(std::slice::from_ref(&m)));
+        queue.write_buffer(
+            &self.buf,
+            index as u64 * 64,
+            super::as_bytes(std::slice::from_ref(&m)),
+        );
         self.upload_count += 1;
         self.entries.push(m);
         Ok(index)
@@ -1157,7 +1216,7 @@ impl TextureStore {
             None => return Err(TextureError::SlotsExhausted),
         };
 
-        let resident = Self::create_resident(device, queue, desc, data)?;
+        let resident = Self::create_resident(device, queue, desc, &[data])?;
 
         if self.free.last() == Some(&slot) {
             self.free.pop();
@@ -1170,6 +1229,34 @@ impl TextureStore {
         self.textures[slot as usize] = Some(resident);
         self.upload_count += 1;
 
+        Ok(slot)
+    }
+
+    /// Register a texture from complete mip data, ordered from level zero.
+    /// Every source level is validated before allocation state is changed.
+    pub fn register_mips(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        desc: &wgpu::TextureDescriptor<'_>,
+        mip_data: &[&[u8]],
+    ) -> Result<u32, TextureError> {
+        let slot = match self.free.last().copied() {
+            Some(slot) => slot,
+            None if self.next < self.max_slots => self.next,
+            None => return Err(TextureError::SlotsExhausted),
+        };
+        let resident = Self::create_resident(device, queue, desc, mip_data)?;
+        if self.free.last() == Some(&slot) {
+            self.free.pop();
+        } else {
+            debug_assert_eq!(slot, self.next);
+            self.next += 1;
+            self.textures.resize_with(self.next as usize, || None);
+        }
+        debug_assert!(self.textures[slot as usize].is_none());
+        self.textures[slot as usize] = Some(resident);
+        self.upload_count += 1;
         Ok(slot)
     }
 
@@ -1197,7 +1284,7 @@ impl TextureStore {
         {
             return Err(TextureError::SlotOccupied);
         }
-        let resident = Self::create_resident(device, queue, desc, data)?;
+        let resident = Self::create_resident(device, queue, desc, &[data])?;
 
         if slot >= self.next {
             let old_next = self.next;
@@ -1253,7 +1340,7 @@ impl TextureStore {
         if current.shape != TextureShape::from_descriptor(desc) {
             return Err(TextureError::IncompatibleDescriptor);
         }
-        let resident = Self::create_resident(device, queue, desc, data)?;
+        let resident = Self::create_resident(device, queue, desc, &[data])?;
         self.textures[slot as usize] = Some(resident);
         self.upload_count += 1;
         Ok(())
@@ -1277,18 +1364,13 @@ impl TextureStore {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         desc: &wgpu::TextureDescriptor<'_>,
-        data: &[u8],
+        mip_data: &[&[u8]],
     ) -> Result<ResidentTexture, TextureError> {
-        if desc.size.width == 0
-            || desc.size.height == 0
-            || desc.size.depth_or_array_layers == 0
-        {
+        if desc.size.width == 0 || desc.size.height == 0 || desc.size.depth_or_array_layers == 0 {
             return Err(TextureError::InvalidExtent);
         }
-        if desc.mip_level_count != 1 {
-            return Err(TextureError::UnsupportedMipLevelCount(
-                desc.mip_level_count,
-            ));
+        if mip_data.len() != desc.mip_level_count as usize {
+            return Err(TextureError::UnsupportedMipLevelCount(desc.mip_level_count));
         }
         if desc.sample_count != 1 {
             return Err(TextureError::UnsupportedSampleCount(desc.sample_count));
@@ -1302,34 +1384,45 @@ impl TextureStore {
             .block_copy_size(None)
             .ok_or(TextureError::UnsupportedFormat)?;
         let (block_width, block_height) = desc.format.block_dimensions();
-        let physical_size = desc.size.physical_size(desc.format);
-        let width_blocks = physical_size.width / block_width;
-        let height_blocks = physical_size.height / block_height;
-        let expected_u64 = u64::from(block_size)
-            .checked_mul(u64::from(width_blocks))
-            .and_then(|size| size.checked_mul(u64::from(height_blocks)))
-            .and_then(|size| size.checked_mul(u64::from(physical_size.depth_or_array_layers)))
-            .ok_or(TextureError::DataSizeOverflow)?;
-        let expected =
-            usize::try_from(expected_u64).map_err(|_| TextureError::DataSizeOverflow)?;
-        if data.len() != expected {
-            return Err(TextureError::InvalidDataLength {
-                expected,
-                actual: data.len(),
-            });
-        }
-
         let texture = device.create_texture(desc);
-        queue.write_texture(
-            texture.as_image_copy(),
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(block_size * width_blocks),
-                rows_per_image: Some(height_blocks),
-            },
-            physical_size,
-        );
+        for (mip_level, data) in mip_data.iter().enumerate() {
+            let level_size = wgpu::Extent3d {
+                width: (desc.size.width >> mip_level).max(1),
+                height: (desc.size.height >> mip_level).max(1),
+                depth_or_array_layers: desc.size.depth_or_array_layers,
+            };
+            let physical_size = level_size.physical_size(desc.format);
+            let width_blocks = physical_size.width / block_width;
+            let height_blocks = physical_size.height / block_height;
+            let expected_u64 = u64::from(block_size)
+                .checked_mul(u64::from(width_blocks))
+                .and_then(|size| size.checked_mul(u64::from(height_blocks)))
+                .and_then(|size| size.checked_mul(u64::from(physical_size.depth_or_array_layers)))
+                .ok_or(TextureError::DataSizeOverflow)?;
+            let expected =
+                usize::try_from(expected_u64).map_err(|_| TextureError::DataSizeOverflow)?;
+            if data.len() != expected {
+                return Err(TextureError::InvalidDataLength {
+                    expected,
+                    actual: data.len(),
+                });
+            }
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: mip_level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(block_size * width_blocks),
+                    rows_per_image: Some(height_blocks),
+                },
+                physical_size,
+            );
+        }
         Ok(ResidentTexture {
             texture,
             shape: TextureShape::from_descriptor(desc),
@@ -1402,7 +1495,10 @@ mod tests {
         // Next alloc at align 16 must skip to 16, leaving [10,16) as a
         // reclaimable pad rather than being silently lost.
         let b = r.alloc(8, 16).unwrap();
-        assert_eq!(b, 16, "aligned alloc skips the pad rather than starting at 10");
+        assert_eq!(
+            b, 16,
+            "aligned alloc skips the pad rather than starting at 10"
+        );
         // A small alloc that fits exactly in the [10,16) pad must succeed,
         // proving the pad was tracked as free space (not leaked).
         let c = r.alloc(6, 1).unwrap();
@@ -1422,7 +1518,11 @@ mod tests {
         // [0,300) span — provable by a single alloc of the full size.
         r.free(b, 100);
         let whole = r.alloc(300, 1);
-        assert_eq!(whole, Some(0), "all three adjacent frees coalesced into one span");
+        assert_eq!(
+            whole,
+            Some(0),
+            "all three adjacent frees coalesced into one span"
+        );
     }
 
     #[test]
@@ -1438,7 +1538,10 @@ mod tests {
         let a = r.alloc(32, 1).unwrap();
         r.free(a, 32);
         let b = r.alloc(32, 1).unwrap();
-        assert_eq!(a, b, "freed space reused by the next alloc of the same size");
+        assert_eq!(
+            a, b,
+            "freed space reused by the next alloc of the same size"
+        );
     }
 
     #[test]
