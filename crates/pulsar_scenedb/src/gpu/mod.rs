@@ -87,7 +87,9 @@ pub use buffer::{GpuBufferDispatch, SceneBuffer, SyncStats, GAP_MERGE_THRESHOLD}
 pub use component_presence::ComponentPresenceBuffer;
 pub use context::EngineGpuContext;
 pub use dirty::DirtyMask;
-pub use dirty_tracked_scene_buffer::{DirtyTrackedGpuBufferDispatch, DirtyTrackedSceneBuffer};
+pub use dirty_tracked_scene_buffer::{
+    DirtyTrackedGpuBufferDispatch, DirtyTrackedReallocationPolicy, DirtyTrackedSceneBuffer,
+};
 pub use dynamic_buffer::{CapacityError, DynamicGpuBuffer};
 pub use generation::GenerationBuffer;
 pub use grid::{

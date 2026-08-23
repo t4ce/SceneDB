@@ -716,6 +716,14 @@ pub fn generate_gpu_column_set(
                     concat!(stringify!(#name), "::presence"),
                 );
                 #(#register_growable_calls)*
+                store.register_world_mirror_registration(
+                    ::pulsar_scenedb::gpu::GpuMirrorRegistration {
+                        component_id: ::pulsar_scenedb::component::component_id::<#name #ty_generics>,
+                        descriptors: #mirror_descriptors_fn_name,
+                        dispatch: #mirror_dispatch_fn_name,
+                        clear: #mirror_clear_fn_name,
+                    }
+                );
             }
         }
 

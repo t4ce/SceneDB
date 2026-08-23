@@ -91,6 +91,33 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         })
     }
 
+    fn growth_target(
+        &self,
+        device: &wgpu::Device,
+        min_capacity: u32,
+    ) -> Result<Option<u32>, CapacityError> {
+        if min_capacity <= self.capacity {
+            return Ok(None);
+        }
+        let device_limit_rows =
+            (device.limits().max_buffer_size / std::mem::size_of::<T>().max(1) as u64) as u32;
+        let effective_max = match self.max_capacity {
+            Some(max) => max.min(device_limit_rows),
+            None => device_limit_rows,
+        };
+        if min_capacity > effective_max {
+            return Err(CapacityError {
+                requested: min_capacity,
+                max: effective_max,
+            });
+        }
+        let mut new_capacity = self.capacity.max(1);
+        while new_capacity < min_capacity {
+            new_capacity = new_capacity.saturating_mul(2);
+        }
+        Ok(Some(new_capacity.min(effective_max)))
+    }
+
     /// Ensures `capacity() >= min_capacity`, growing (doubling from the
     /// current capacity, or starting from 1 if it's currently 0, until the
     /// requirement is met) and GPU-to-GPU copying the buffer's existing
@@ -123,23 +150,9 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         queue: &wgpu::Queue,
         min_capacity: u32,
     ) -> Result<bool, CapacityError> {
-        if min_capacity <= self.capacity {
+        let Some(new_capacity) = self.growth_target(device, min_capacity)? else {
             return Ok(false);
-        }
-        let device_limit_rows =
-            (device.limits().max_buffer_size / std::mem::size_of::<T>().max(1) as u64) as u32;
-        let effective_max = match self.max_capacity {
-            Some(max) => max.min(device_limit_rows),
-            None => device_limit_rows,
         };
-        if min_capacity > effective_max {
-            return Err(CapacityError { requested: min_capacity, max: effective_max });
-        }
-        let mut new_capacity = self.capacity.max(1);
-        while new_capacity < min_capacity {
-            new_capacity = new_capacity.saturating_mul(2);
-        }
-        new_capacity = new_capacity.min(effective_max);
 
         let new_buf = Self::alloc(device, &self.label, new_capacity);
         // Copy the live prefix (the old buffer's full capacity — every row
@@ -156,6 +169,27 @@ impl<T: Pod> DynamicGpuBuffer<T> {
         }
 
         self.buf = new_buf;
+        self.capacity = new_capacity;
+        self.epoch += 1;
+        Ok(true)
+    }
+
+    /// Grow without preserving the old allocation's bytes.
+    ///
+    /// This is intentionally separate from [`Self::ensure_capacity`]. It is
+    /// only correct for an owner that can reconstruct every surviving row
+    /// from another authority (for example `DirtyTrackedSceneBuffer`'s CPU
+    /// shadow). It emits no command encoder or GPU copy; the caller must
+    /// rewrite the new allocation before publishing it to consumers.
+    pub fn ensure_capacity_discarding(
+        &mut self,
+        device: &wgpu::Device,
+        min_capacity: u32,
+    ) -> Result<bool, CapacityError> {
+        let Some(new_capacity) = self.growth_target(device, min_capacity)? else {
+            return Ok(false);
+        };
+        self.buf = Self::alloc(device, &self.label, new_capacity);
         self.capacity = new_capacity;
         self.epoch += 1;
         Ok(true)
@@ -217,6 +251,32 @@ impl<T: Pod> DynamicGpuBuffer<T> {
             queue.submit([encoder.finish()]);
         }
         self.buf = new_buf;
+        self.capacity = target;
+        self.epoch += 1;
+        true
+    }
+
+    /// Shrink without copying the surviving prefix. See
+    /// [`Self::ensure_capacity_discarding`] for the required ownership
+    /// contract: the caller must reconstruct all rows in the replacement.
+    pub fn shrink_to_fit_discarding(
+        &mut self,
+        device: &wgpu::Device,
+        highest_live_row: u32,
+        slack_factor: f32,
+    ) -> bool {
+        debug_assert!(
+            slack_factor >= 1.0,
+            "slack_factor < 1.0 would shrink below the caller's own stated live-row watermark"
+        );
+        let target = (((highest_live_row as u64 + 1) as f64
+            * slack_factor.max(1.0) as f64)
+            .ceil() as u64)
+            .min(u32::MAX as u64) as u32;
+        if target >= self.capacity {
+            return false;
+        }
+        self.buf = Self::alloc(device, &self.label, target);
         self.capacity = target;
         self.epoch += 1;
         true

@@ -70,12 +70,27 @@ use crate::gpu::scatter_write::ScatterWritePipeline;
 use crate::gpu::{DirtyMask, DynamicGpuBuffer, SyncStats};
 use crate::page::Pod;
 use std::cell::UnsafeCell;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// Fixed synchronization overhead per dirty-tracked buffer. This avoids a
 /// mutex beside every row (which would dominate compact u32 columns), while
 /// making same-row writes safe. The mask keeps the modulo branch-free.
 const ROW_LOCK_SHARDS: usize = 1024;
+
+/// How a DirtyTracked column preserves its contents when its physical GPU
+/// allocation changes.
+///
+/// `GpuCopy` is the normal high-throughput path. `RewriteFromCpuShadow` is an
+/// additive portability policy for backends that support buffer creation and
+/// queue writes but do not yet expose command-encoder buffer copies. It is
+/// valid here because DirtyTracked owns a complete row-indexed CPU shadow;
+/// Once columns deliberately cannot select this policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DirtyTrackedReallocationPolicy {
+    #[default]
+    GpuCopy,
+    RewriteFromCpuShadow,
+}
 
 /// A single shadow row, readable/writable through `&self` — see this
 /// module's "Concurrency" doc section for the full soundness argument.
@@ -119,9 +134,14 @@ struct DirtyTrackedState<T: Pod> {
     dirty: DirtyMask,
     /// Scratch buffers for [`super::scatter_write`]'s GPU-side scatter path
     /// — sized to whatever the largest flush so far needed, not to `buf`'s
-    /// capacity; grown lazily inside `flush` itself, same as `buf`.
-    scatter_indices: DynamicGpuBuffer<u32>,
-    scatter_values: DynamicGpuBuffer<u32>,
+    /// capacity. The allocation itself is also lazy: direct-write-only
+    /// columns consume no extra GPU handles/pages.
+    scatter_scratch: Option<ScatterScratch>,
+}
+
+struct ScatterScratch {
+    indices: DynamicGpuBuffer<u32>,
+    values: DynamicGpuBuffer<u32>,
 }
 
 /// Grows `state.shadow`/`state.dirty` (pure CPU, no GPU work) to cover
@@ -204,17 +224,18 @@ fn flush_via_scatter<T: Pod>(
     scatter: &ScatterWritePipeline,
     buf: &mut DynamicGpuBuffer<T>,
     shadow: &[ShadowRow<T>],
-    scatter_indices: &mut DynamicGpuBuffer<u32>,
-    scatter_values: &mut DynamicGpuBuffer<u32>,
+    scratch: &mut ScatterScratch,
     dirty_rows: &[u32],
 ) -> SyncStats {
     let words_per_element = (std::mem::size_of::<T>() / 4) as u32;
     let dirty_count = dirty_rows.len() as u32;
 
-    scatter_indices
+    scratch
+        .indices
         .ensure_capacity(device, queue, dirty_count)
         .expect("scatter-write scratch buffer has no max_capacity -- growth cannot fail");
-    scatter_values
+    scratch
+        .values
         .ensure_capacity(device, queue, dirty_count * words_per_element)
         .expect("scatter-write scratch buffer has no max_capacity -- growth cannot fail");
 
@@ -224,7 +245,7 @@ fn flush_via_scatter<T: Pod>(
         .iter()
         .map(|&row| shadow[row as usize].get())
         .collect();
-    scatter_indices.write(queue, 0, dirty_rows);
+    scratch.indices.write(queue, 0, dirty_rows);
     // SAFETY: reinterpreting `&[T]` as `&[u32]` of `values.len() *
     // words_per_element` elements -- valid because `T: Pod` (no padding/
     // niche issues) and `DirtyTrackedSceneBuffer::new` asserts
@@ -236,13 +257,13 @@ fn flush_via_scatter<T: Pod>(
             values.len() * words_per_element as usize,
         )
     };
-    scatter_values.write(queue, 0, values_as_u32);
+    scratch.values.write(queue, 0, values_as_u32);
 
     scatter.dispatch(
         device,
         queue,
-        scatter_indices.buffer(),
-        scatter_values.buffer(),
+        scratch.indices.buffer(),
+        scratch.values.buffer(),
         buf.buffer(),
         words_per_element,
         dirty_count,
@@ -294,16 +315,34 @@ pub trait DirtyTrackedGpuBufferDispatch: Send + Sync {
 
 pub struct DirtyTrackedSceneBuffer<T: Pod> {
     device: Arc<wgpu::Device>,
-    /// Stateless after construction (see [`ScatterWritePipeline`]'s doc) --
-    /// lives outside the lock deliberately, so using it never needs to wait
-    /// on `state`.
-    scatter: Arc<ScatterWritePipeline>,
+    /// Constructed only if a flush actually crosses the scatter threshold.
+    /// Small/direct-write workloads therefore need no shader-module or
+    /// compute-pipeline support merely to register a mirrored component.
+    /// It lives outside `state`, so initialization never recursively borrows
+    /// the buffer state.
+    scatter: OnceLock<ScatterWritePipeline>,
+    label: String,
+    reallocation_policy: DirtyTrackedReallocationPolicy,
     state: RwLock<DirtyTrackedState<T>>,
     row_locks: Box<[Mutex<()>]>,
 }
 
 impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
     pub fn new(device: Arc<wgpu::Device>, label: &str, initial_capacity: u32) -> Self {
+        Self::new_with_reallocation_policy(
+            device,
+            label,
+            initial_capacity,
+            DirtyTrackedReallocationPolicy::GpuCopy,
+        )
+    }
+
+    pub fn new_with_reallocation_policy(
+        device: Arc<wgpu::Device>,
+        label: &str,
+        initial_capacity: u32,
+        reallocation_policy: DirtyTrackedReallocationPolicy,
+    ) -> Self {
         // gpu::scatter_write's shader treats every element as whole `u32`
         // words -- see its module doc for why this is the one requirement
         // on `T` that isn't already implied by `Pod`.
@@ -322,21 +361,15 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             .map(|_| ShadowRow::new(unsafe { std::mem::zeroed::<T>() }))
             .collect();
         let dirty = DirtyMask::new(initial_capacity);
-        // Capacity 1, not 0 -- a zero-sized wgpu buffer is invalid (`size`
-        // must be > 0). Grows to whatever a flush actually needs, same as
-        // every other lazily-grown buffer in this crate.
-        let scatter_indices =
-            DynamicGpuBuffer::new(&device, &format!("{label}-scatter-indices"), 1);
-        let scatter_values = DynamicGpuBuffer::new(&device, &format!("{label}-scatter-values"), 1);
-        let scatter = Arc::new(ScatterWritePipeline::new(&device));
         Self {
-            scatter,
+            scatter: OnceLock::new(),
+            label: label.to_owned(),
+            reallocation_policy,
             state: RwLock::new(DirtyTrackedState {
                 buf,
                 shadow,
                 dirty,
-                scatter_indices,
-                scatter_values,
+                scatter_scratch: None,
             }),
             row_locks: (0..ROW_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             device,
@@ -408,14 +441,29 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             .state
             .write()
             .expect("DirtyTrackedSceneBuffer lock poisoned");
-        if state.buf.capacity() < capacity {
-            state.buf.reserve(&self.device, queue, capacity)?;
-        }
+        let rebuilt_from_shadow = if state.buf.capacity() < capacity {
+            match self.reallocation_policy {
+                DirtyTrackedReallocationPolicy::GpuCopy => {
+                    state.buf.reserve(&self.device, queue, capacity)?;
+                    false
+                }
+                DirtyTrackedReallocationPolicy::RewriteFromCpuShadow => state
+                    .buf
+                    .ensure_capacity_discarding(&self.device, capacity)?,
+            }
+        } else {
+            false
+        };
         // Grow the unbounded host shadow only after DynamicGpuBuffer has
         // checked the device/configured ceiling. Otherwise an invalid huge
         // reservation can hang or OOM in Vec growth instead of returning
         // CapacityError as this API promises.
         grow_shadow_to(&mut state, capacity as usize);
+        if rebuilt_from_shadow {
+            for row in 0..state.shadow.len() as u32 {
+                state.dirty.mark(row);
+            }
+        }
         Ok(())
     }
 
@@ -451,9 +499,22 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             }
         }
         state.dirty = new_dirty;
-        state
-            .buf
-            .shrink_to_fit(&self.device, queue, highest_live_row, slack_factor)
+        let rebuilt_from_shadow = match self.reallocation_policy {
+            DirtyTrackedReallocationPolicy::GpuCopy => state
+                .buf
+                .shrink_to_fit(&self.device, queue, highest_live_row, slack_factor),
+            DirtyTrackedReallocationPolicy::RewriteFromCpuShadow => state
+                .buf
+                .shrink_to_fit_discarding(&self.device, highest_live_row, slack_factor),
+        };
+        if rebuilt_from_shadow
+            && self.reallocation_policy == DirtyTrackedReallocationPolicy::RewriteFromCpuShadow
+        {
+            for row in 0..state.shadow.len() as u32 {
+                state.dirty.mark(row);
+            }
+        }
+        rebuilt_from_shadow
     }
 
     /// Above this many contiguous runs, [`Self::flush`] switches from direct
@@ -475,10 +536,28 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             .expect("DirtyTrackedSceneBuffer lock poisoned");
         let shadow_len = state.shadow.len() as u32;
         if state.buf.capacity() < shadow_len {
-            state
-                .buf
-                .ensure_capacity(&self.device, queue, shadow_len)
-                .expect("DirtyTrackedSceneBuffer never sets a max_capacity -- growth cannot fail");
+            let rebuilt_from_shadow = match self.reallocation_policy {
+                DirtyTrackedReallocationPolicy::GpuCopy => {
+                    state
+                        .buf
+                        .ensure_capacity(&self.device, queue, shadow_len)
+                        .expect(
+                            "DirtyTrackedSceneBuffer never sets a max_capacity -- growth cannot fail",
+                        );
+                    false
+                }
+                DirtyTrackedReallocationPolicy::RewriteFromCpuShadow => state
+                    .buf
+                    .ensure_capacity_discarding(&self.device, shadow_len)
+                    .expect(
+                        "DirtyTrackedSceneBuffer never sets a max_capacity -- growth cannot fail",
+                    ),
+            };
+            if rebuilt_from_shadow {
+                for row in 0..shadow_len {
+                    state.dirty.mark(row);
+                }
+            }
         }
 
         // Gather every dirty row once -- O(capacity/64 + dirty_count), the
@@ -507,21 +586,36 @@ impl<T: Pod + Send + Sync + 'static> DirtyTrackedSceneBuffer<T> {
             let DirtyTrackedState { buf, shadow, .. } = &mut *state;
             flush_via_direct_writes(buf, shadow, &dirty_rows, queue)
         } else {
+            let scatter = self
+                .scatter
+                .get_or_init(|| ScatterWritePipeline::new(&self.device));
+            if state.scatter_scratch.is_none() {
+                state.scatter_scratch = Some(ScatterScratch {
+                    indices: DynamicGpuBuffer::new(
+                        &self.device,
+                        &format!("{}-scatter-indices", self.label),
+                        1,
+                    ),
+                    values: DynamicGpuBuffer::new(
+                        &self.device,
+                        &format!("{}-scatter-values", self.label),
+                        1,
+                    ),
+                });
+            }
             let DirtyTrackedState {
                 buf,
                 shadow,
-                scatter_indices,
-                scatter_values,
+                scatter_scratch,
                 ..
             } = &mut *state;
             flush_via_scatter(
                 &self.device,
                 queue,
-                &self.scatter,
+                scatter,
                 buf,
                 shadow,
-                scatter_indices,
-                scatter_values,
+                scatter_scratch.as_mut().expect("scatter scratch initialized"),
                 &dirty_rows,
             )
         };
@@ -641,6 +735,14 @@ mod tests {
         let (device, queue) = test_device();
         let buf: DirtyTrackedSceneBuffer<u32> =
             DirtyTrackedSceneBuffer::new(Arc::clone(&device), "test", 8);
+        assert!(
+            buf.scatter.get().is_none(),
+            "registration must not eagerly require a compute pipeline"
+        );
+        assert!(
+            buf.state.read().unwrap().scatter_scratch.is_none(),
+            "registration must not eagerly allocate scatter staging buffers"
+        );
 
         buf.mark_dirty(0, 111);
         buf.mark_dirty(1, 222);
@@ -656,6 +758,14 @@ mod tests {
         );
 
         let stats = buf.flush(&queue);
+        assert!(
+            buf.scatter.get().is_none(),
+            "the direct-write path must not initialize scatter"
+        );
+        assert!(
+            buf.state.read().unwrap().scatter_scratch.is_none(),
+            "the direct-write path must not allocate scatter staging buffers"
+        );
         // Two runs: [0,1] (adjacent, one coalesced write) and [5,5] --
         // strict adjacency (no gap bridging), matching SceneBuffer::sync_region's
         // GAP_MERGE_THRESHOLD == 0 default.
@@ -880,6 +990,14 @@ mod tests {
             "scatter path reports one GPU operation regardless of how many rows were scattered"
         );
         assert_eq!(stats.bytes, dirty_rows.len() as u64 * 4);
+        assert!(
+            buf.scatter.get().is_some(),
+            "the many-run path must initialize scatter on first use"
+        );
+        assert!(
+            buf.state.read().unwrap().scatter_scratch.is_some(),
+            "the many-run path must allocate staging buffers on first use"
+        );
 
         let mut bytes = Vec::new();
         buf.with_buffer(&mut |b| bytes = readback(&device, &queue, b, capacity as u64 * 4));
@@ -947,6 +1065,39 @@ mod tests {
                 "row {row}: every one of the 16 words must match, not just the first"
             );
         }
+    }
+
+    #[test]
+    fn cpu_shadow_reallocation_rewrites_every_surviving_row() {
+        let (device, queue) = test_device();
+        let buf: DirtyTrackedSceneBuffer<u32> =
+            DirtyTrackedSceneBuffer::new_with_reallocation_policy(
+                Arc::clone(&device),
+                "cpu-shadow-growth",
+                2,
+                DirtyTrackedReallocationPolicy::RewriteFromCpuShadow,
+            );
+
+        buf.mark_dirty(0, 11);
+        buf.mark_dirty(1, 22);
+        buf.flush(&queue);
+
+        // Row 5 grows the shadow and then the GPU allocation from 2 to 8.
+        // The old allocation is deliberately discarded, so rows 0 and 1 can
+        // survive only if the policy really rebuilds them from the shadow.
+        buf.mark_dirty(5, 66);
+        let stats = buf.flush(&queue);
+        assert_eq!(buf.epoch(), 1);
+        assert_eq!(stats.ranges, 1);
+        assert_eq!(stats.bytes, 8 * 4);
+
+        let mut bytes = Vec::new();
+        buf.with_buffer(&mut |buffer| bytes = readback(&device, &queue, buffer, 8 * 4));
+        let rows: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+            .collect();
+        assert_eq!(rows, [11, 22, 0, 0, 0, 66, 0, 0]);
     }
 
     #[test]

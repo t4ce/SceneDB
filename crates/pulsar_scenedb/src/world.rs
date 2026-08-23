@@ -373,7 +373,7 @@ impl World {
             let arch = &self.archetypes[arch_id.0 as usize];
             for &cid in &arch.active_cids {
                 if let (Some(clear), Some(gpu_row)) = (
-                    crate::gpu::world_mirror::clear_for(cid),
+                    mirror.clear_for(cid),
                     mirror.gpu_row_for_component(cid, entity),
                 ) {
                     let transitioned = mirror.store().mark_component_absent(cid, gpu_row);
@@ -567,7 +567,7 @@ impl World {
         // when no mirror is attached or `T` has no `#[gpu]` fields.
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
-            if let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) {
+            if let Some(dispatch) = mirror.dispatch_for(cid) {
                 // For an in-place replacement the old value is still live in
                 // its archetype column until after dispatch returns. Passing
                 // that borrowed pointer lets the concrete generated function
@@ -788,7 +788,7 @@ impl World {
         #[cfg(feature = "gpu")]
         if let Some(mirror) = &self.gpu_mirror {
             if let (Some(clear), Some(gpu_row)) = (
-                crate::gpu::world_mirror::clear_for(cid),
+                mirror.clear_for(cid),
                 mirror.gpu_row_for_component(cid, entity),
             ) {
                 let transitioned = mirror.store().mark_component_absent(cid, gpu_row);
@@ -918,8 +918,9 @@ impl World {
 
         #[cfg(feature = "gpu")]
         assert!(
-            self.gpu_mirror.is_none()
-                || crate::gpu::world_mirror::dispatch_for(cid).is_none(),
+            self.gpu_mirror
+                .as_ref()
+                .is_none_or(|mirror| !mirror.has_dispatch_for(cid)),
             "get_mut cannot borrow GPU-mirrored component {:?} mutably; use World::edit or World::insert so mirror dirty dispatch runs",
             cid,
         );
@@ -1119,7 +1120,7 @@ impl World {
             let Some(mirror) = &self.gpu_mirror else {
                 return;
             };
-            let Some(dispatch) = crate::gpu::world_mirror::dispatch_for(cid) else {
+            let Some(dispatch) = mirror.dispatch_for(cid) else {
                 return;
             };
             let slot = &self.entity_slots[entity.index() as usize];

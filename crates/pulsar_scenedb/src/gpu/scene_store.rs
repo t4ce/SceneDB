@@ -11,9 +11,10 @@
 
 use super::{
     CapacityError, ComponentPresenceBuffer, DirtyMask, DirtyTrackedGpuBufferDispatch,
-    DirtyTrackedSceneBuffer, EngineGpuContext, GenerationBuffer, GpuBufferDispatch,
-    GrowableGpuBufferDispatch, GrowableSceneBuffer, OnceGpuBufferDispatch, OnceSceneBuffer,
-    RegionError, RegionPool, SceneBuffer, SimulateWitness, SubmissionTracker, SyncStats,
+    DirtyTrackedReallocationPolicy, DirtyTrackedSceneBuffer, EngineGpuContext, GenerationBuffer,
+    GpuBufferDispatch, GrowableGpuBufferDispatch, GrowableSceneBuffer, OnceGpuBufferDispatch,
+    OnceSceneBuffer, RegionError, RegionPool, SceneBuffer, SimulateWitness, SubmissionTracker,
+    SyncStats,
 };
 use crate::cell::{CellStorage, PendingRetire};
 use crate::component::{component_id, ComponentId};
@@ -21,6 +22,7 @@ use crate::handle::Handle;
 use crate::page::Pod;
 use crate::spatial::InstanceInfo;
 use crate::token::HasTypeToken;
+use crate::gpu::world_mirror::{GpuMirrorRegistration, RegistrationFns};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -443,11 +445,16 @@ pub struct CellSlot<'a> {
 pub struct SceneGpuStore {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    dirty_tracked_reallocation_policy: DirtyTrackedReallocationPolicy,
     /// Stable field↔buffer partner metadata. Kept separate from the physical
     /// allocation maps so fixed CellStorage and growable World stores use the
     /// same identity and compatibility rules without conflating their
     /// different capacity/lifetime models.
     gpu_partners: GpuPartnerRegistry,
+    /// Concrete World dispatch installed by the same explicit registration
+    /// call that allocates each component's partner columns. Link-time
+    /// inventory is retained only as a hosted compatibility fallback.
+    world_mirror_registrations: HashMap<ComponentId, RegistrationFns>,
     /// Type-erased GPU buffers keyed by `ComponentId`.  Replaces the old
     /// concrete `transforms` / `instance_infos` fields (pre-work item 3).
     /// Registered via [`Self::register_gpu_buffer`].
@@ -519,6 +526,24 @@ impl SceneGpuStore {
         Arc::clone(&self.device)
     }
 
+    /// Select the construction-time reallocation policy for subsequently
+    /// registered DirtyTracked World columns and their liveness buffers.
+    pub fn set_dirty_tracked_reallocation_policy(
+        &mut self,
+        policy: DirtyTrackedReallocationPolicy,
+    ) {
+        assert!(
+            self.dirty_tracked_gpu_buffers.is_empty()
+                && self.component_presence_buffers.is_empty(),
+            "DirtyTracked reallocation policy must be selected before World GPU columns are registered",
+        );
+        self.dirty_tracked_reallocation_policy = policy;
+    }
+
+    pub fn dirty_tracked_reallocation_policy(&self) -> DirtyTrackedReallocationPolicy {
+        self.dirty_tracked_reallocation_policy
+    }
+
     pub fn new(ctx: &EngineGpuContext, cfg: SceneGpuConfig) -> Self {
         let mut row_pools = Vec::with_capacity(cfg.classes.len());
         let mut slot_pools = Vec::with_capacity(cfg.classes.len());
@@ -557,7 +582,9 @@ impl SceneGpuStore {
         let mut store = Self {
             device: Arc::clone(ctx.device()),
             queue: Arc::clone(ctx.queue()),
+            dirty_tracked_reallocation_policy: DirtyTrackedReallocationPolicy::GpuCopy,
             gpu_partners: GpuPartnerRegistry::default(),
+            world_mirror_registrations: HashMap::new(),
             gpu_buffers: HashMap::new(),
             growable_gpu_buffers: HashMap::new(),
             dirty_tracked_gpu_buffers: HashMap::new(),
@@ -645,6 +672,33 @@ impl SceneGpuStore {
     /// Convenience for hand-written [`GpuColumnSet`] implementations.
     pub fn register_gpu_columns_for<T: GpuColumnSet>(&mut self) {
         self.register_gpu_column_descs(T::gpu_columns());
+    }
+
+    /// Couple a concrete component's World mirror dispatch to the explicit
+    /// growable-buffer registration that owns its partner columns.
+    #[doc(hidden)]
+    pub fn register_world_mirror_registration(&mut self, registration: GpuMirrorRegistration) {
+        let id = (registration.component_id)();
+        let previous = self.world_mirror_registrations.insert(
+            id,
+            RegistrationFns {
+                dispatch: registration.dispatch,
+                clear: registration.clear,
+                descriptors: registration.descriptors,
+            },
+        );
+        assert!(
+            previous.is_none(),
+            "World mirror component {id:?} was explicitly registered more than once"
+        );
+    }
+
+    #[inline]
+    pub(crate) fn world_mirror_registration(
+        &self,
+        id: ComponentId,
+    ) -> Option<RegistrationFns> {
+        self.world_mirror_registrations.get(&id).copied()
     }
 
     /// Claims one canonical GPU destination for a single owning World
@@ -1716,7 +1770,12 @@ impl SceneGpuStore {
         if self.dirty_tracked_gpu_buffers.contains_key(&id) {
             return;
         }
-        let buffer = DirtyTrackedSceneBuffer::<T>::new(Arc::clone(device), label, initial_capacity);
+        let buffer = DirtyTrackedSceneBuffer::<T>::new_with_reallocation_policy(
+            Arc::clone(device),
+            label,
+            initial_capacity,
+            self.dirty_tracked_reallocation_policy,
+        );
         self.dirty_tracked_gpu_buffers.insert(id, Box::new(buffer));
     }
 
@@ -1760,7 +1819,12 @@ impl SceneGpuStore {
     ) {
         self.component_presence_buffers.insert(
             component_id,
-            ComponentPresenceBuffer::new(Arc::clone(&self.device), label, initial_capacity),
+            ComponentPresenceBuffer::new_with_reallocation_policy(
+                Arc::clone(&self.device),
+                label,
+                initial_capacity,
+                self.dirty_tracked_reallocation_policy,
+            ),
         );
     }
 

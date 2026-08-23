@@ -11,7 +11,9 @@
 //! zeroed on removal as hygiene, but zero bytes are not themselves a generic
 //! absence sentinel (zero can be a perfectly valid mesh/material index).
 
-use crate::gpu::{CapacityError, DirtyTrackedSceneBuffer, SyncStats};
+use crate::gpu::{
+    CapacityError, DirtyTrackedReallocationPolicy, DirtyTrackedSceneBuffer, SyncStats,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -28,8 +30,27 @@ pub struct ComponentPresenceBuffer {
 
 impl ComponentPresenceBuffer {
     pub fn new(device: Arc<wgpu::Device>, label: &str, initial_capacity: u32) -> Self {
+        Self::new_with_reallocation_policy(
+            device,
+            label,
+            initial_capacity,
+            DirtyTrackedReallocationPolicy::GpuCopy,
+        )
+    }
+
+    pub fn new_with_reallocation_policy(
+        device: Arc<wgpu::Device>,
+        label: &str,
+        initial_capacity: u32,
+        reallocation_policy: DirtyTrackedReallocationPolicy,
+    ) -> Self {
         Self {
-            buf: DirtyTrackedSceneBuffer::new(device, label, initial_capacity),
+            buf: DirtyTrackedSceneBuffer::new_with_reallocation_policy(
+                device,
+                label,
+                initial_capacity,
+                reallocation_policy,
+            ),
             rows: RwLock::new(
                 (0..initial_capacity)
                     .map(|_| AtomicBool::new(false))

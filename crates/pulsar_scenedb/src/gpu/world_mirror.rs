@@ -71,8 +71,8 @@
 use crate::component::{component_id, Component, ComponentId};
 use crate::entity::Entity;
 use crate::gpu::{
-    CapacityError, DirtyTrackedSceneBuffer, GpuColumnDesc, GpuColumnSet, MirrorMode, SceneGpuStore,
-    SyncStats,
+    CapacityError, DirtyTrackedReallocationPolicy, DirtyTrackedSceneBuffer, GpuColumnDesc,
+    GpuColumnSet, MirrorMode, SceneGpuStore, SyncStats,
 };
 use ahash::AHashMap;
 use std::collections::HashMap;
@@ -139,13 +139,21 @@ pub struct GenerationMirror {
 }
 
 impl GenerationMirror {
-    fn new(device: Arc<wgpu::Device>) -> Self {
+    fn new(
+        device: Arc<wgpu::Device>,
+        reallocation_policy: DirtyTrackedReallocationPolicy,
+    ) -> Self {
         // Small initial capacity, unbounded growth -- matches every other
         // World-mirrored buffer's recommended (register_gpu_columns_growable)
         // configuration; see that method's doc for why World-mirrored
         // buffers specifically should never set a max_capacity ceiling.
         Self {
-            buf: DirtyTrackedSceneBuffer::new(device, "scenedb-world-mirror-generations", 64),
+            buf: DirtyTrackedSceneBuffer::new_with_reallocation_policy(
+                device,
+                "scenedb-world-mirror-generations",
+                64,
+                reallocation_policy,
+            ),
             gpu_mirrored_rows: GpuMirroredRows::new(),
         }
     }
@@ -438,7 +446,10 @@ pub struct GpuMirrorHandle {
 
 impl GpuMirrorHandle {
     pub fn new(store: Arc<SceneGpuStore>, queue: Arc<wgpu::Queue>) -> Self {
-        let generations = Arc::new(GenerationMirror::new(store.device_arc()));
+        let generations = Arc::new(GenerationMirror::new(
+            store.device_arc(),
+            store.dirty_tracked_reallocation_policy(),
+        ));
         Self {
             store,
             queue,
@@ -460,6 +471,45 @@ impl GpuMirrorHandle {
     #[inline]
     pub fn generations(&self) -> &GenerationMirror {
         &self.generations
+    }
+
+    /// Resolve dispatch from the store registration that allocated this
+    /// mirror's columns. Link-time inventory remains a hosted compatibility
+    /// fallback, but executable correctness does not depend on linker-section
+    /// constructors being preserved (notably for Blueprint ET_REL images).
+    #[inline]
+    pub(crate) fn dispatch_for(&self, id: ComponentId) -> Option<DispatchFn> {
+        self.store
+            .world_mirror_registration(id)
+            .map(|entry| entry.dispatch)
+            .or_else(|| dispatch_for(id))
+    }
+
+    #[inline]
+    pub(crate) fn clear_for(&self, id: ComponentId) -> Option<ClearFn> {
+        self.store
+            .world_mirror_registration(id)
+            .map(|entry| entry.clear)
+            .or_else(|| clear_for(id))
+    }
+
+    #[inline]
+    pub(crate) fn has_dispatch_for(&self, id: ComponentId) -> bool {
+        self.dispatch_for(id).is_some()
+    }
+
+    /// Return the physical partner descriptors installed into this mirror's
+    /// store. The explicit store registration is authoritative; link-time
+    /// inventory remains only a compatibility fallback for hosted callers
+    /// that reflect a type without constructing a store.
+    pub fn gpu_column_descs_for_component(
+        &self,
+        id: ComponentId,
+    ) -> Option<Vec<GpuColumnDesc>> {
+        self.store
+            .world_mirror_registration(id)
+            .map(|entry| (entry.descriptors)())
+            .or_else(|| gpu_column_descs_for_component(id))
     }
 
     /// Returns `entity`'s stable GPU row for component `T` in its current
@@ -744,10 +794,10 @@ pub struct GpuMirrorRegistration {
 pulsar_reflection::inventory::collect!(GpuMirrorRegistration);
 
 #[derive(Clone, Copy)]
-struct RegistrationFns {
-    dispatch: DispatchFn,
-    clear: ClearFn,
-    descriptors: DescriptorsFn,
+pub(crate) struct RegistrationFns {
+    pub(crate) dispatch: DispatchFn,
+    pub(crate) clear: ClearFn,
+    pub(crate) descriptors: DescriptorsFn,
 }
 
 fn registry_map() -> &'static HashMap<ComponentId, RegistrationFns> {

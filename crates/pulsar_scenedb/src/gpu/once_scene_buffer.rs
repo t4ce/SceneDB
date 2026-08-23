@@ -15,7 +15,7 @@
 use crate::gpu::scatter_write::ScatterWritePipeline;
 use crate::gpu::{CapacityError, DynamicGpuBuffer, SyncStats};
 use crate::page::Pod;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 struct OnceState<T: Pod> {
     buf: DynamicGpuBuffer<T>,
@@ -23,8 +23,12 @@ struct OnceState<T: Pod> {
     upload_indices: Vec<u32>,
     upload_values: Vec<T>,
     upload_words: Vec<u32>,
-    scatter_indices: DynamicGpuBuffer<u32>,
-    scatter_values: DynamicGpuBuffer<u32>,
+    scatter_scratch: Option<OnceScatterScratch>,
+}
+
+struct OnceScatterScratch {
+    indices: DynamicGpuBuffer<u32>,
+    values: DynamicGpuBuffer<u32>,
 }
 
 /// Type-erased storage used by [`super::SceneGpuStore`].
@@ -46,7 +50,11 @@ pub trait OnceGpuBufferDispatch: Send + Sync {
 
 pub struct OnceSceneBuffer<T: Pod> {
     device: Arc<wgpu::Device>,
-    scatter: ScatterWritePipeline,
+    /// Most Once workloads coalesce into a handful of direct writes. Avoid
+    /// requiring shader-module/compute support until a flush genuinely uses
+    /// the many-run scatter path.
+    scatter: OnceLock<ScatterWritePipeline>,
+    label: String,
     state: Mutex<OnceState<T>>,
 }
 
@@ -65,19 +73,11 @@ impl<T: Pod + Send + Sync + 'static> OnceSceneBuffer<T> {
             upload_indices: Vec::new(),
             upload_values: Vec::new(),
             upload_words: Vec::new(),
-            scatter_indices: DynamicGpuBuffer::new(
-                &device,
-                &format!("{label}-once-scatter-indices"),
-                1,
-            ),
-            scatter_values: DynamicGpuBuffer::new(
-                &device,
-                &format!("{label}-once-scatter-values"),
-                1,
-            ),
+            scatter_scratch: None,
         };
         Self {
-            scatter: ScatterWritePipeline::new(&device),
+            scatter: OnceLock::new(),
+            label: label.to_owned(),
             device,
             state: Mutex::new(state),
         }
@@ -171,15 +171,37 @@ impl<T: Pod + Send + Sync + 'static> OnceSceneBuffer<T> {
             stats
         } else {
             let words_per_element = (std::mem::size_of::<T>() / 4) as u32;
-            state
-                .scatter_indices
+            if state.scatter_scratch.is_none() {
+                state.scatter_scratch = Some(OnceScatterScratch {
+                    indices: DynamicGpuBuffer::new(
+                        &self.device,
+                        &format!("{}-once-scatter-indices", self.label),
+                        1,
+                    ),
+                    values: DynamicGpuBuffer::new(
+                        &self.device,
+                        &format!("{}-once-scatter-values", self.label),
+                        1,
+                    ),
+                });
+            }
+            let OnceState {
+                buf,
+                scatter_scratch,
+                ..
+            } = &mut *state;
+            let scratch = scatter_scratch
+                .as_mut()
+                .expect("Once scatter scratch initialized");
+            scratch
+                .indices
                 .ensure_capacity(&self.device, queue, count)
                 .expect("Once scatter-index scratch is unbounded");
-            state
-                .scatter_values
+            scratch
+                .values
                 .ensure_capacity(&self.device, queue, count * words_per_element)
                 .expect("Once scatter-value scratch is unbounded");
-            state.scatter_indices.write(queue, 0, &upload_indices);
+            scratch.indices.write(queue, 0, &upload_indices);
 
             upload_words.clear();
             upload_words.reserve(count as usize * words_per_element as usize);
@@ -198,13 +220,15 @@ impl<T: Pod + Send + Sync + 'static> OnceSceneBuffer<T> {
                         .map(|word| u32::from_ne_bytes(word.try_into().unwrap())),
                 );
             }
-            state.scatter_values.write(queue, 0, &upload_words);
-            self.scatter.dispatch(
+            scratch.values.write(queue, 0, &upload_words);
+            self.scatter
+                .get_or_init(|| ScatterWritePipeline::new(&self.device))
+                .dispatch(
                 &self.device,
                 queue,
-                state.scatter_indices.buffer(),
-                state.scatter_values.buffer(),
-                state.buf.buffer(),
+                scratch.indices.buffer(),
+                scratch.values.buffer(),
+                buf.buffer(),
                 words_per_element,
                 count,
             );
@@ -327,5 +351,36 @@ impl<T: Pod + Send + Sync + 'static> OnceGpuBufferDispatch for OnceSceneBuffer<T
 
     fn pending_count(&self) -> usize {
         OnceSceneBuffer::pending_count(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_once_handoff_does_not_initialize_scatter_pipeline() {
+        let (device, queue) = crate::gpu::test_support::test_gpu();
+        let buf = OnceSceneBuffer::<u32>::new(device, "once-lazy-scatter", 4);
+        assert!(
+            buf.scatter.get().is_none(),
+            "registration must not eagerly require a compute pipeline"
+        );
+        assert!(
+            buf.state.lock().unwrap().scatter_scratch.is_none(),
+            "registration must not eagerly allocate scatter staging buffers"
+        );
+
+        buf.queue_handoff(0, 17);
+        let stats = buf.flush(&queue);
+        assert_eq!((stats.ranges, stats.bytes), (1, 4));
+        assert!(
+            buf.scatter.get().is_none(),
+            "the direct-write path must not initialize scatter"
+        );
+        assert!(
+            buf.state.lock().unwrap().scatter_scratch.is_none(),
+            "the direct-write path must not allocate scatter staging buffers"
+        );
     }
 }

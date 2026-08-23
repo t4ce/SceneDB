@@ -329,7 +329,9 @@ impl<'w, Q: WorldQueryMut<'w>> QueryIterMut<'w, Q> {
             Q::for_each_access(&mut |component, mutable| {
                 assert!(
                     !mutable
-                        || crate::gpu::world_mirror::dispatch_for(component).is_none(),
+                        || world
+                            .gpu_mirror()
+                            .is_none_or(|mirror| !mirror.has_dispatch_for(component)),
                     "query_mut cannot borrow GPU-mirrored component {:?} mutably; copy the value and replace it with World::insert so mirror dirty dispatch runs",
                     component,
                 );
