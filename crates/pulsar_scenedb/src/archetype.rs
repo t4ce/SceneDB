@@ -146,18 +146,6 @@ impl Archetype {
         self.entities.is_empty()
     }
 
-    /// Register a column for component type `T`.  No-op if already registered.
-    pub(crate) fn register_column<T: Component>(&mut self) {
-        let cid = crate::component::component_id::<T>();
-        let idx = cid.0 as usize;
-        for _ in self.columns.len()..=idx {
-            self.columns.push(None);
-        }
-        if self.columns[idx].is_none() {
-            self.columns[idx] = Some(Box::new(Column::<T>::new()));
-        }
-    }
-
     #[inline]
     pub(crate) fn column<T: Component>(&self) -> &Column<T> {
         let cid = crate::component::component_id::<T>();
@@ -190,12 +178,6 @@ impl Archetype {
             .unwrap_or_else(|| unreachable!("downcast should match after type_id check"))
     }
 
-    pub(crate) fn has_column<T: Component>(&self) -> bool {
-        let cid = crate::component::component_id::<T>();
-        let idx = cid.0 as usize;
-        idx < self.columns.len() && self.columns[idx].is_some()
-    }
-
     /// True if this archetype has all of the components identified by `ids`.
     #[inline]
     pub(crate) fn has_columns(&self, ids: &[ComponentId]) -> bool {
@@ -219,15 +201,6 @@ impl Archetype {
         self.columns
             .get(cid.0 as usize)
             .and_then(|c| c.as_deref())
-    }
-
-    /// Get a mutable erased column by ComponentId.
-    #[inline]
-    pub(crate) fn get_erased_mut(&mut self, cid: ComponentId) -> Option<&mut dyn ErasedColumn> {
-        self.columns
-            .get_mut(cid.0 as usize)
-            .and_then(|c| c.as_mut())
-            .map(|b| b.as_mut())
     }
 
     /// Remove the entity at `row` (swap-remove).  Returns the swapped-in

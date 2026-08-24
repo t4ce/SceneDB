@@ -486,26 +486,6 @@ impl World {
         arch.columns[idx] = Some(col);
     }
 
-    /// Collect all CIDs that have a column in this archetype (for migration).
-    fn collect_cids(arch: &Archetype) -> Vec<ComponentId> {
-        arch.columns
-            .iter()
-            .enumerate()
-            .filter(|(_, col)| col.is_some())
-            .map(|(i, _)| ComponentId(i as u32))
-            .collect()
-    }
-
-    /// Collect all CIDs except `skip` (for migration skip).
-    fn collect_cids_skip(arch: &Archetype, skip: ComponentId) -> Vec<ComponentId> {
-        arch.columns
-            .iter()
-            .enumerate()
-            .filter(|(i, col)| col.is_some() && ComponentId(*i as u32) != skip)
-            .map(|(i, _)| ComponentId(i as u32))
-            .collect()
-    }
-
     // â”€â”€ Component operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Add a component to an entity, migrating it to a new archetype if needed.

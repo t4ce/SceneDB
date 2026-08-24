@@ -59,7 +59,6 @@ pub(crate) trait GenericColumnAny: Send + Sync {
     fn push_row(&mut self);
     fn pop_row(&mut self);
     fn swap(&mut self, a: u32, b: u32);
-    fn len(&self) -> usize;
     fn as_any_ref(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -197,10 +196,6 @@ impl<T: Send + Sync + 'static> GenericColumnAny for GenericColumn<T> {
 
     fn swap(&mut self, a: u32, b: u32) {
         GenericColumn::swap(self, a, b);
-    }
-
-    fn len(&self) -> usize {
-        self.data.len()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -446,11 +441,6 @@ impl Page {
     /// Push a new generic column onto this page (used during cell construction).
     pub(crate) fn push_generic_column(&mut self, col: Box<dyn GenericColumnAny>) {
         self.generic_columns.push(col);
-    }
-
-    /// Iterate generic columns (for type-erased operations in CellStorage).
-    pub(crate) fn generic_columns(&self) -> &[Box<dyn GenericColumnAny>] {
-        &self.generic_columns
     }
 
     /// Mutable iteration over generic columns.

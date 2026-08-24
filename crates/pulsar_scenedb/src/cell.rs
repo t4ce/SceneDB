@@ -385,21 +385,25 @@ impl CellStorage {
     }
 
     /// Access the generic-column index (telemetry).
+    #[cfg(feature = "telemetry")]
     pub(crate) fn generic_token_index_slice(&self) -> &[(ComponentId, TypeId, usize)] {
         &self.generic_token_index
     }
 
     /// Number of user columns (telemetry).
+    #[cfg(feature = "telemetry")]
     pub(crate) fn user_column_count(&self) -> usize {
         self.user_column_count
     }
 
     /// Column capacity (telemetry).
+    #[cfg(feature = "telemetry")]
     pub(crate) fn capacity(&self) -> u32 {
         self.page.layout().capacity()
     }
 
     /// Element size of a physical column (telemetry).
+    #[cfg(feature = "telemetry")]
     pub(crate) fn column_size_pub(&self, col: usize) -> usize {
         self.column_size(col)
     }

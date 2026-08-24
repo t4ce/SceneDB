@@ -178,14 +178,6 @@ impl RegisteredCellType {
         self.tokens.iter().map(|t| t.id()).collect()
     }
 
-    /// Generic entry descriptor data (component id + type id) in declaration
-    /// order.
-    pub(crate) fn generic_descs(&self) -> Vec<(ComponentId, TypeId)> {
-        self.generic_entries
-            .iter()
-            .map(|e| (e.component_id, e.type_id))
-            .collect()
-    }
 }
 
 #[cfg(test)]

@@ -120,10 +120,6 @@ impl<T: Any + Send + Sync + 'static> Component for T {}
 pub(crate) trait ErasedColumn: Any + Send + Sync {
     fn type_id(&self) -> TypeId;
     fn len(&self) -> usize;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Remove the value at `row` (swap-remove semantics, returns a
     /// heap-allocated pointer to the moved-out value).  The caller is
     /// responsible for dropping the returned pointer.
@@ -163,8 +159,6 @@ pub(crate) trait ErasedColumn: Any + Send + Sync {
 
     fn new_empty(&self) -> Box<dyn ErasedColumn>;
 
-    /// Size in bytes of a single element in this column.
-    fn element_size(&self) -> usize;
 }
 
 pub(crate) struct Column<T: Component> {
@@ -174,16 +168,6 @@ pub(crate) struct Column<T: Component> {
 impl<T: Component> Column<T> {
     pub fn new() -> Self {
         Self { data: Vec::new() }
-    }
-
-    #[inline]
-    pub fn as_slice(&self) -> &[T] {
-        &self.data
-    }
-
-    #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
-        &mut self.data
     }
 }
 
@@ -235,9 +219,5 @@ impl<T: Component> ErasedColumn for Column<T> {
 
     fn new_empty(&self) -> Box<dyn ErasedColumn> {
         Box::new(Column::<T>::new())
-    }
-
-    fn element_size(&self) -> usize {
-        std::mem::size_of::<T>()
     }
 }

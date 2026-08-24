@@ -920,21 +920,6 @@ impl SceneGpuStore {
         self.gen_writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Ensure a dirty mask exists for the given component id in this cell.
-    /// Used by write paths to lazily create the mask when a column is first
-    /// written (instead of requiring it to exist at registration time).
-    fn ensure_dirty_column(
-        state: &mut CellGpuState,
-        id: ComponentId,
-        row_capacity: u32,
-    ) -> &mut DirtyMask {
-        let idx = id.0 as usize;
-        if state.dirty_columns.len() <= idx {
-            state.dirty_columns.resize_with(idx + 1, || None);
-        }
-        state.dirty_columns[idx].get_or_insert_with(|| DirtyMask::new(row_capacity))
-    }
-
     /// §4.1 promotion primitive (α: registration; β reuses it for promotion):
     /// allocates row+slot regions, bulk-rebuilds the generation region from
     /// the registry, seeds the gen-shadow, marks all occupied rows dirty in
@@ -2175,6 +2160,7 @@ impl SceneGpuStore {
     // ── Telemetry / snapshot accessors (pub(crate)) ──────────────────────
 
     /// GPU buffers map for telemetry snapshot.
+    #[cfg(feature = "telemetry")]
     pub(crate) fn telemetry_gpu_buffers(
         &self,
     ) -> &HashMap<ComponentId, Box<dyn GpuBufferDispatch>> {
@@ -2182,16 +2168,19 @@ impl SceneGpuStore {
     }
 
     /// Row region pools for telemetry snapshot.
+    #[cfg(feature = "telemetry")]
     pub(crate) fn telemetry_row_pools(&self) -> &[RegionPool] {
         &self.row_pools
     }
 
     /// Slot region pools for telemetry snapshot.
+    #[cfg(feature = "telemetry")]
     pub(crate) fn telemetry_slot_pools(&self) -> &[RegionPool] {
         &self.slot_pools
     }
 
     /// Per-cell GPU state for telemetry snapshot.
+    #[cfg(feature = "telemetry")]
     pub(crate) fn telemetry_cells(&self) -> &[Option<CellGpuState>] {
         &self.cells
     }
