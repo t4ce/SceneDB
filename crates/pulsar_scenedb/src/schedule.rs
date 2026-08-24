@@ -54,13 +54,10 @@ impl Schedule {
     /// Each system receives `&mut world` and `time`.  Profiling scopes are
     /// emitted for the overall run and for each named system.
     pub fn run(&mut self, world: &mut World, time: GameTime) {
-        #[cfg(not(target_arch = "wasm32"))]
-        profiling::profile_scope!("Schedule::run");
+        let _schedule_span = tracing::info_span!("Schedule::run").entered();
         for (name, system) in &mut self.systems {
-            #[cfg(not(target_arch = "wasm32"))]
-            profiling::profile_scope!(format!("Schedule::System::{}", name));
-            #[cfg(target_arch = "wasm32")]
-            let _ = name;
+            let _system_span =
+                tracing::info_span!("Schedule::System", system = name.as_str()).entered();
             system(world, time);
         }
     }

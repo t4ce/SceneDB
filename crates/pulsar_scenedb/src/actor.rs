@@ -115,8 +115,7 @@ impl ActorRegistry {
     pub fn tick_all(&mut self, world: &mut World) {
         for entry in &mut self.entries {
             if entry.alive {
-                #[cfg(not(target_arch = "wasm32"))]
-                profiling::profile_scope!(format!("Actor::Tick::{}", entry.entity));
+                let _span = tracing::info_span!("Actor::Tick", entity = %entry.entity).entered();
                 entry.actor.tick(entry.entity, world);
             }
         }

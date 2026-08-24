@@ -24,9 +24,6 @@ tracing           = { workspace = true }
 wgpu              = { version = "30", optional = true }
 bytemuck          = { version = "1.25", features = ["derive"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-profiling = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Profiling", rev = "12424a5f75166332f9f1d2741281f6fc4847b44d" }
-
 [dev-dependencies]
 rand = "0.8"
 criterion = { version = "=0.8.2" }
