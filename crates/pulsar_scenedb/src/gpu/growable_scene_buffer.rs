@@ -24,7 +24,7 @@ use std::sync::{Arc, RwLock};
 /// the trait signature has nowhere to put). [`Self::with_buffer`] is the
 /// lock-safe replacement: it hands the current buffer to a closure for the
 /// duration of one call, never leaking a guard past that.
-pub trait GrowableGpuBufferDispatch: Send + Sync {
+pub trait GrowableGpuBufferDispatch: super::DispatchBounds {
     /// Grows if necessary (see [`GrowableSceneBuffer::write_row_growing`])
     /// then writes. `data`'s length must be a multiple of the element size;
     /// mismatches are a logic error in the caller (the derive-generated

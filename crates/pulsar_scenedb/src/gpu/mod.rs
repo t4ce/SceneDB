@@ -31,6 +31,22 @@ mod tracker;
 mod view_upload;
 pub mod world_mirror;
 
+/// Native GPU handles may cross worker threads; browser WebGPU handles are
+/// intentionally confined to the browser's single UI thread.
+#[doc(hidden)]
+#[cfg(not(target_arch = "wasm32"))]
+pub trait DispatchBounds: Send + Sync {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> DispatchBounds for T {}
+
+#[doc(hidden)]
+#[cfg(target_arch = "wasm32")]
+pub trait DispatchBounds {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> DispatchBounds for T {}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::{Arc, OnceLock};

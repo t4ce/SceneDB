@@ -119,6 +119,7 @@ impl<T: Any + Send + Sync + 'static> Component for T {}
 
 pub(crate) trait ErasedColumn: Any + Send + Sync {
     fn type_id(&self) -> TypeId;
+    #[cfg(debug_assertions)]
     fn len(&self) -> usize;
     /// Remove the value at `row` (swap-remove semantics, returns a
     /// heap-allocated pointer to the moved-out value).  The caller is
@@ -176,6 +177,7 @@ impl<T: Component> ErasedColumn for Column<T> {
         TypeId::of::<T>()
     }
 
+    #[cfg(debug_assertions)]
     fn len(&self) -> usize {
         self.data.len()
     }

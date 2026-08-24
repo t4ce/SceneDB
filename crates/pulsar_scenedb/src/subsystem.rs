@@ -47,10 +47,9 @@ use crate::World;
 /// A named engine subsystem hooked into SceneDB's phase machine.
 ///
 /// All hooks default to no-ops — implement only the phases a given
-/// subsystem actually needs. `Any + Send + Sync` (not just `Any`) matches
-/// the rest of the crate's threading assumptions (`SystemFn` in
-/// `schedule.rs` carries the same bounds).
-pub trait Subsystem: Any + Send + Sync {
+/// subsystem actually needs. Native instances retain `Send + Sync`; browser
+/// WebGPU instances remain on the browser's single thread.
+pub trait Subsystem: Any + crate::gpu::DispatchBounds {
     /// Stable registry key. Also used as the dynamic-dispatch name once
     /// method dispatch lands (see module docs).
     fn name(&self) -> &'static str;

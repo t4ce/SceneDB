@@ -278,7 +278,7 @@ fn flush_via_scatter<T: Pod>(
 /// Type-erased counterpart, mirroring [`super::GrowableGpuBufferDispatch`]'s
 /// own reasoning (the buffer lives behind a lock, so `&wgpu::Buffer` can't be
 /// returned directly — [`Self::with_buffer`] is the lock-safe replacement).
-pub trait DirtyTrackedGpuBufferDispatch: Send + Sync {
+pub trait DirtyTrackedGpuBufferDispatch: super::DispatchBounds {
     /// Records `data` as row `row`'s new value and marks it dirty — no GPU
     /// work at all (not even a device/queue borrow) unless growth is needed,
     /// in which case only the CPU-side shadow/mask grow; the GPU buffer

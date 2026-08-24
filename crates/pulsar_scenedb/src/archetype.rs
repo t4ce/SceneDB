@@ -86,6 +86,7 @@ impl ArchetypeKey {
 /// and the entity vec.  Entity removal uses `swap_remove` â€” the last entity
 /// is moved into the vacated slot and its row is updated in the slot map.
 pub struct Archetype {
+    #[cfg(debug_assertions)]
     pub(crate) id: ArchetypeId,
     pub(crate) key: ArchetypeKey,
     /// Pre-computed, immutable list of this archetype's component IDs.
@@ -105,9 +106,10 @@ pub struct Archetype {
 }
 
 impl Archetype {
-    pub(crate) fn new_empty(id: ArchetypeId) -> Self {
+    pub(crate) fn new_empty(_id: ArchetypeId) -> Self {
         Self {
-            id,
+            #[cfg(debug_assertions)]
+            id: _id,
             key: ArchetypeKey(vec![]),
             active_cids: Vec::new(),
             columns: Vec::new(),
@@ -116,7 +118,7 @@ impl Archetype {
         }
     }
 
-    pub(crate) fn new(id: ArchetypeId, key: ArchetypeKey) -> Self {
+    pub(crate) fn new(_id: ArchetypeId, key: ArchetypeKey) -> Self {
         let mask = key
             .0
             .iter()
@@ -125,7 +127,8 @@ impl Archetype {
             .fold(0u64, |m, i| m | (1u64 << (i - 1)));
         let active_cids = key.0.clone();
         Self {
-            id,
+            #[cfg(debug_assertions)]
+            id: _id,
             key,
             active_cids,
             columns: Vec::new(),

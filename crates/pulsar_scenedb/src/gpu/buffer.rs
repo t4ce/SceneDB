@@ -77,7 +77,7 @@ pub const GAP_MERGE_THRESHOLD: u32 = 0;
 /// Type-erased GPU buffer dispatch: allows `SceneGpuStore` to sync any
 /// column's byte data through a matching `SceneBuffer<T>` without knowing
 /// `T` at compile time.
-pub trait GpuBufferDispatch: Send + Sync {
+pub trait GpuBufferDispatch: super::DispatchBounds {
     /// Coalescing delta-sync from a byte slice (reinterpreted as `&[T]`
     /// inside the implementation).  Clears the dirty mask.
     fn sync_region(

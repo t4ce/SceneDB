@@ -32,7 +32,7 @@ struct OnceScatterScratch {
 }
 
 /// Type-erased storage used by [`super::SceneGpuStore`].
-pub trait OnceGpuBufferDispatch: Send + Sync {
+pub trait OnceGpuBufferDispatch: super::DispatchBounds {
     fn queue_handoff_bytes(&self, row: u32, data: &[u8]);
     fn flush(&self, queue: &wgpu::Queue) -> SyncStats;
     fn reserve(&self, queue: &wgpu::Queue, capacity: u32) -> Result<(), CapacityError>;
